@@ -22,10 +22,9 @@ class AnalysisWorker:
     Background worker for analyzing call transcripts.
 
     Flow:
-    1. Find records with transcription_status='success' and analysis_status='pending'
-    2. Send transcript to Gemini
-    3. Parse JSON response
-    4. Update record with analysis results
+      1. Find transcription_status='success' AND analysis_status='pending'
+      2. Analyze transcript with Gemini
+      3. Save results or failure status
     """
 
     def __init__(self):
@@ -33,40 +32,48 @@ class AnalysisWorker:
         self.batch_size = settings.WORKER_BATCH_SIZE
         self.poll_interval = settings.WORKER_POLL_INTERVAL_SECONDS
 
+    # ----------------------------------------------------------------------
+    # PROCESS BATCH
+    # ----------------------------------------------------------------------
     def process_batch(self) -> int:
-        """
-        Process a batch of pending analysis.
-
-        Returns:
-            Number of records processed
-        """
         try:
             pending = CallRecordsDB.find_pending_analysis(self.batch_size)
         except DatabaseError as e:
-            logger.error(f"Database error finding pending records: {e}")
+            logger.error(f"Database error fetching pending analysis: {e}")
             return 0
 
         if not pending:
-            logger.debug("No pending analysis")
+            logger.debug("No pending analysis tasks")
             return 0
 
         logger.info(f"Processing {len(pending)} pending analyses")
         processed = 0
 
         for record in pending:
+            record_id = record["id"]
+
             try:
                 self._process_record(record)
                 processed += 1
+
             except Exception as e:
-                logger.error(f"Failed to analyze record {record['id']}: {e}")
-                CallRecordsDB.update_analysis(
-                    record["id"], status="failed", error=str(e)
-                )
+                logger.error(f"Failed to analyze record {record_id}: {e}")
+
+                try:
+                    CallRecordsDB.update_analysis(
+                        record_id, status="failed", error=str(e)
+                    )
+                except Exception as db_err:
+                    logger.error(
+                        f"Failed to update analysis failure state for {record_id}: {db_err}"
+                    )
 
         return processed
 
+    # ----------------------------------------------------------------------
+    # PROCESS SINGLE RECORD
+    # ----------------------------------------------------------------------
     def _process_record(self, record: Dict[str, Any]):
-        """Process a single analysis record."""
         record_id = record["id"]
         transcript = record.get("transcript_text", "")
         language = record.get("language_detected")
@@ -75,23 +82,31 @@ class AnalysisWorker:
         logger.info(f"Analyzing record {record_id}")
 
         if not transcript:
-            raise CallAnalysisError("No transcript available for analysis")
+            raise CallAnalysisError("Transcript missing — cannot analyze")
 
-        # Analyze with Gemini
+        # Gemini analysis
         analysis = self.analyzer.analyze(
-            transcript=transcript, language_detected=language, agent_name=agent_name
+            transcript=transcript,
+            language_detected=language,
+            agent_name=agent_name,
         )
 
-        # Update database
-        CallRecordsDB.update_analysis(record_id, analysis=analysis, status="success")
+        # Save results
+        CallRecordsDB.update_analysis(
+            record_id,
+            analysis=analysis,
+            status="success",
+        )
 
         logger.info(
-            f"Analysis complete for {record_id}: "
+            f"Analysis complete for {record_id} — "
             f"score={analysis['overall_score']}, warning={analysis['has_warning']}"
         )
 
+    # ----------------------------------------------------------------------
+    # LOOP MODE
+    # ----------------------------------------------------------------------
     def run_forever(self):
-        """Run the worker continuously."""
         logger.info("Starting Analysis Worker")
 
         while True:
@@ -99,7 +114,6 @@ class AnalysisWorker:
                 processed = self.process_batch()
                 if processed > 0:
                     logger.info(f"Processed {processed} analyses")
-
             except Exception as e:
                 logger.error(f"Worker error: {e}")
 
@@ -107,7 +121,6 @@ class AnalysisWorker:
 
 
 def run_worker():
-    """Entry point for analysis worker."""
     worker = AnalysisWorker()
     worker.run_forever()
 

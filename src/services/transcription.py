@@ -3,7 +3,7 @@
 AssemblyAI Transcription Service with TRUE Diarization V2 + Clean Transcript.
 
 This version:
-- Uses correct AssemblyAI diarization parameters
+- Uses correct AssemblyAI diarization v2 parameters
 - Extracts real speaker-separated segments
 - Converts to Agent/Customer roles
 - Produces clean, readable transcript for Gemini
@@ -50,8 +50,7 @@ class TranscriptionService:
         logger.info(f"Starting transcription for: {audio_path}")
 
         upload_url = self._upload_file(audio_path)
-
-        logger.info(f"Audio uploaded successfully.")
+        logger.info("Audio uploaded successfully.")
 
         job_id = self._create_transcription_job(
             upload_url,
@@ -94,7 +93,7 @@ class TranscriptionService:
         return resp.json()["upload_url"]
 
     # ----------------------------------------------------------------------
-    # CREATE JOB
+    # CREATE JOB  (FIXED DIARIZATION CONFIG)
     # ----------------------------------------------------------------------
     def _create_transcription_job(
         self,
@@ -103,18 +102,16 @@ class TranscriptionService:
         speakers_expected: int,
     ) -> str:
 
+        # CORRECT AssemblyAI diarization v2 parameters
         payload = {
             "audio_url": audio_url,
             "punctuate": True,
             "format_text": True,
             "language_detection": not bool(language_code),
             "disfluencies": False,
-            # REAL DIARIZATION V2
-            "diarization": {
-                "enable": True,
-                "min_speakers": speakers_expected,
-                "max_speakers": speakers_expected,
-            },
+            # FIXED diarization config:
+            "speaker_labels": True,
+            "speakers_expected": speakers_expected,
         }
 
         if language_code:

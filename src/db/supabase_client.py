@@ -1,4 +1,3 @@
-# src/db/supabase_client.py
 """
 Supabase PostgreSQL client for call_records.
 
@@ -6,6 +5,7 @@ Uses Supabase REST interface for all operations.
 """
 
 import logging
+import json
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
@@ -54,7 +54,6 @@ class CallRecordsDB:
     def insert_call_record(cls, call_data: Dict[str, Any]) -> str:
         sb = cls.client()
 
-        # IMPORTANT: Do NOT send "id" → Supabase will autogenerate UUID
         payload = {
             "call_id": call_data.get("call_id"),
             "agent_id": call_data.get("agent_id"),
@@ -69,13 +68,15 @@ class CallRecordsDB:
             "alert_email_status": "pending",
         }
 
-        # Remove missing/None fields
         payload = {k: v for k, v in payload.items() if v is not None}
 
-        resp = sb.table("call_records").insert(payload).execute()
+        try:
+            resp = sb.table("call_records").insert(payload).execute()
+        except Exception as e:
+            raise DatabaseError(f"Insert failed: {e}")
 
-        if resp.error:
-            raise DatabaseError(f"Insert failed: {resp.error}")
+        if not resp.data:
+            raise DatabaseError("Insert failed: Supabase returned no data")
 
         record_id = resp.data[0]["id"]
         logger.info(f"Inserted call record {record_id}")
@@ -92,7 +93,7 @@ class CallRecordsDB:
             sb.table("call_records")
             .select("*")
             .eq("transcription_status", "pending")
-            .order("created_at", asc=True)
+            .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
@@ -106,7 +107,7 @@ class CallRecordsDB:
             .select("*")
             .eq("transcription_status", "success")
             .eq("analysis_status", "pending")
-            .order("created_at", asc=True)
+            .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
@@ -121,7 +122,7 @@ class CallRecordsDB:
             .eq("analysis_status", "success")
             .eq("has_warning", True)
             .eq("alert_email_status", "pending")
-            .order("created_at", asc=True)
+            .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
@@ -168,10 +169,14 @@ class CallRecordsDB:
         sb = cls.client()
 
         if status == "success" and analysis:
+
+            # Encode warning reasons as JSON string for storage
+            reasons_json = json.dumps(analysis.get("warning_reasons", []))
+
             payload = {
                 "overall_score": analysis["overall_score"],
                 "has_warning": analysis["has_warning"],
-                "warning_reasons_json": analysis["warning_reasons"],
+                "warning_reasons_json": reasons_json,
                 "short_summary": analysis["short_summary"],
                 "customer_sentiment": analysis["customer_sentiment"],
                 "department": analysis["department"],
