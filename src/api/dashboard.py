@@ -1,15 +1,11 @@
+# src/api/dashboard.py
 """
-Admin Dashboard API
-
-Provides REST API for the admin dashboard:
-- GET /api/calls — List recent calls
-- GET /api/calls/{id} — Get call details
-- GET /api/stats — Aggregate statistics
+Admin Dashboard API — Production Version
 """
 
 import logging
-from typing import Optional, List
 from datetime import datetime, timedelta
+from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -17,7 +13,6 @@ from pydantic import BaseModel
 from ..db.supabase_client import CallRecordsDB, DatabaseError
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api", tags=["Dashboard"])
 
 
@@ -67,58 +62,57 @@ class DashboardStats(BaseModel):
 
 
 # ------------------------------------------------------------------
-# ENDPOINTS
+# CALL LIST ENDPOINT
 # ------------------------------------------------------------------
 @router.get("/calls", response_model=List[CallSummary])
 async def list_calls(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status: Optional[str] = Query(None, description="Filter by analysis_status"),
-    warning_only: bool = Query(False, description="Only show calls with warnings"),
+    warning_only: bool = Query(False, description="Only calls with warnings"),
 ):
-    """Get list of recent calls."""
+    """
+    Paginated + filtered list of calls.
+    * Uses DB-level filtering for performance
+    * Safe pagination
+    """
     try:
-        calls = CallRecordsDB.get_recent_calls(limit=limit + offset)
-
-        # Apply filters
-        if status:
-            calls = [c for c in calls if c.get("analysis_status") == status]
-
-        if warning_only:
-            calls = [c for c in calls if c.get("has_warning")]
-
-        # Apply offset
-        calls = calls[offset : offset + limit]
-
+        calls = CallRecordsDB.list_calls(
+            limit=limit,
+            offset=offset,
+            analysis_status=status,
+            warnings_only=warning_only,
+        )
         return calls
 
     except DatabaseError as e:
-        logger.error(f"Database error: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"DB Error: {e}")
+        raise HTTPException(500, "Database error")
 
 
+# ------------------------------------------------------------------
+# CALL DETAIL ENDPOINT
+# ------------------------------------------------------------------
 @router.get("/calls/{record_id}", response_model=CallDetail)
 async def get_call(record_id: str):
-    """Get full details for a specific call."""
     try:
         call = CallRecordsDB.get_call_by_id(record_id)
-
         if not call:
             raise HTTPException(404, "Call not found")
-
         return call
 
     except DatabaseError as e:
-        logger.error(f"Database error: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"DB Error: {e}")
+        raise HTTPException(500, "Database error")
 
 
+# ------------------------------------------------------------------
+# STATS ENDPOINT
+# ------------------------------------------------------------------
 @router.get("/stats", response_model=DashboardStats)
 async def get_stats():
-    """Get aggregate statistics for the dashboard."""
     try:
-        # Get all calls for stats
-        calls = CallRecordsDB.get_recent_calls(limit=1000)
+        calls = CallRecordsDB.list_calls(limit=2000, offset=0)
 
         if not calls:
             return DashboardStats(
@@ -130,21 +124,22 @@ async def get_stats():
                 calls_this_week=0,
             )
 
-        # Calculate stats
         total = len(calls)
 
+        # Score avg
         scores = [c["overall_score"] for c in calls if c.get("overall_score")]
-        avg_score = sum(scores) / len(scores) if scores else 0.0
+        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
 
+        # Warning count
         warning_count = sum(1 for c in calls if c.get("has_warning"))
 
         # Sentiment breakdown
         sentiments = {}
         for c in calls:
-            s = c.get("customer_sentiment", "unknown")
+            s = (c.get("customer_sentiment") or "unknown").lower()
             sentiments[s] = sentiments.get(s, 0) + 1
 
-        # Time-based counts
+        # Time-based stats
         now = datetime.utcnow()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timedelta(days=7)
@@ -154,22 +149,26 @@ async def get_stats():
 
         for c in calls:
             created = c.get("created_at")
-            if created:
-                try:
-                    # Parse ISO timestamp
-                    if isinstance(created, str):
-                        created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if not created:
+                continue
 
-                    if created.replace(tzinfo=None) >= today_start:
-                        calls_today += 1
-                    if created.replace(tzinfo=None) >= week_start:
-                        calls_this_week += 1
-                except Exception:
-                    pass
+            try:
+                if isinstance(created, str):
+                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+
+                created_utc = created.replace(tzinfo=None)
+
+                if created_utc >= today_start:
+                    calls_today += 1
+                if created_utc >= week_start:
+                    calls_this_week += 1
+
+            except Exception:
+                pass
 
         return DashboardStats(
             total_calls=total,
-            avg_score=round(avg_score, 2),
+            avg_score=avg_score,
             warning_count=warning_count,
             sentiment_breakdown=sentiments,
             calls_today=calls_today,
@@ -177,17 +176,20 @@ async def get_stats():
         )
 
     except DatabaseError as e:
-        logger.error(f"Database error: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"DB Error: {e}")
+        raise HTTPException(500, "Database error")
 
 
+# ------------------------------------------------------------------
+# RE-ANALYZE A CALL
+# ------------------------------------------------------------------
 @router.post("/calls/{record_id}/reanalyze")
 async def reanalyze_call(record_id: str):
-    """Reset a call for re-analysis."""
     try:
         CallRecordsDB.update_analysis_status(record_id, "pending")
+        CallRecordsDB.update_alert_status(record_id, status="pending")
         return {"status": "success", "message": "Call queued for re-analysis"}
 
     except DatabaseError as e:
-        logger.error(f"Database error: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"DB Error: {e}")
+        raise HTTPException(500, "Database error")

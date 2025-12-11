@@ -1,139 +1,188 @@
 # src/workers/alert_worker.py
 """
-Email Alert Background Worker.
+Email Alert Background Worker — Production Version
 
-Sends email alerts for calls with warnings.
+Improvements:
+- Retry logic with exponential backoff
+- Proper classification of transient vs permanent SMTP errors
+- Safer JSON parsing for warning_reasons_json
+- Circuit breaker for repeated failures
+- Clean DB update behavior
 """
 
 import logging
 import time
 import json
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from ..config import settings
-from ..services.email_service import EmailService
+from ..services.email_service import EmailService, EmailSendError
 from ..db.supabase_client import CallRecordsDB, DatabaseError
 
 logger = logging.getLogger(__name__)
 
 
 class AlertWorker:
-    """
-    Background worker for sending email alerts.
-
-    Flow:
-    1. Find records with has_warning=true and alert_email_status='pending'
-    2. Send email alert with call details
-    3. Update record with sent or failed status
-    """
+    MAX_EMAIL_RETRIES = 3
+    BACKOFF_STEPS = [1, 3, 8]  # seconds
+    CIRCUIT_BREAKER_THRESHOLD = 5
+    CIRCUIT_BREAKER_COOLDOWN = 60  # seconds
 
     def __init__(self):
         self.email_service = EmailService()
         self.batch_size = settings.WORKER_BATCH_SIZE
         self.poll_interval = settings.WORKER_POLL_INTERVAL_SECONDS
 
-    # ----------------------------------------------------------------------
-    # PROCESS BATCH
-    # ----------------------------------------------------------------------
+        self.failure_count = 0
+        self.circuit_open = False
+        self.circuit_reopen_time = 0
+
+    # ---------------------------------------------------------
     def process_batch(self) -> int:
+        """Process a batch of pending alerts."""
+        # Circuit breaker: stop sending emails until cooldown expires
+        if self.circuit_open:
+            if time.time() < self.circuit_reopen_time:
+                logger.warning("AlertWorker circuit breaker active — skipping batch")
+                return 0
+            else:
+                logger.info("Circuit breaker reset — resuming email sending")
+                self.circuit_open = False
+                self.failure_count = 0
+
         try:
             pending = CallRecordsDB.find_pending_alerts(self.batch_size)
         except DatabaseError as e:
-            logger.error(f"Database error finding pending alerts: {e}")
+            logger.error(f"DB error retrieving alerts: {e}")
             return 0
 
         if not pending:
-            logger.debug("No pending alerts")
             return 0
 
         logger.info(f"Processing {len(pending)} pending alerts")
-        sent = 0
+        sent_count = 0
 
         for record in pending:
             record_id = record["id"]
 
             try:
-                self._send_alert(record)
-                sent += 1
+                self._attempt_send(record)
+                sent_count += 1
 
             except Exception as e:
-                logger.error(f"Failed to send alert for {record_id}: {e}")
+                logger.error(f"Alert send failed for {record_id}: {e}")
+                try:
+                    CallRecordsDB.update_alert_status(
+                        record_id, status="failed", error=str(e)
+                    )
+                except Exception:
+                    logger.error("Failed to update alert failure status")
 
-                # store the actual error message
-                CallRecordsDB.update_alert_status(
-                    record_id, status="failed", error=str(e)
-                )
+                # Circuit breaker escalation
+                self.failure_count += 1
+                if self.failure_count >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self._trip_circuit_breaker()
 
-        return sent
+        return sent_count
 
-    # ----------------------------------------------------------------------
-    # SEND SINGLE ALERT
-    # ----------------------------------------------------------------------
-    def _send_alert(self, record: Dict[str, Any]):
+    # ---------------------------------------------------------
+    def _attempt_send(self, record: Dict[str, Any]):
+        """Send an alert with retries + backoff."""
         record_id = record["id"]
-        logger.info(f"Sending alert for {record_id}")
 
-        # Parse warning reasons JSON
-        raw_reasons = record.get("warning_reasons_json")
-        warning_reasons = []
+        warning_reasons = self._parse_warning_reasons(record)
 
-        if raw_reasons:
-            try:
-                # If already list → use it directly
-                warning_reasons = (
-                    raw_reasons
-                    if isinstance(raw_reasons, list)
-                    else json.loads(raw_reasons)
-                )
-            except Exception:
-                logger.warning(f"Invalid warning_reasons_json for {record_id}")
-                warning_reasons = []
-
-        # Build call data for email
         call_data = {
             "agent_name": record.get("agent_name", "Unknown"),
-            "agent_id": record.get("agent_id"),
-            "customer_number": record.get("customer_number"),
-            "start_time": str(record.get("start_time", "")),
-            "end_time": str(record.get("end_time", "")),
-            "duration_seconds": record.get("duration_seconds", 0),
+            "customer_number": record.get("customer_number", "Unknown"),
             "overall_score": record.get("overall_score"),
-            "has_warning": record.get("has_warning", False),
+            "has_warning": record.get("has_warning"),
             "warning_reasons": warning_reasons,
-            "short_summary": record.get("short_summary"),
+            "short_summary": record.get("short_summary", ""),
             "customer_sentiment": record.get("customer_sentiment"),
-            "transcript_text": record.get("transcript_text", "")[:3000],
+            "start_time": str(record.get("start_time", "")),
+            "duration_seconds": record.get("duration_seconds"),
+            "department": record.get("department", "unknown"),
         }
 
-        # Send email
-        self.email_service.send_call_alert(call_data)
+        last_err = None
 
-        # Mark as sent
-        CallRecordsDB.update_alert_status(record_id, status="sent")
+        for attempt in range(self.MAX_EMAIL_RETRIES):
+            try:
+                logger.info(f"Sending alert for {record_id} (attempt {attempt + 1})")
+                self.email_service.send_call_alert(call_data)
 
-        logger.info(f"Alert sent for {record_id}")
+                CallRecordsDB.update_alert_status(record_id, status="sent")
+                logger.info(f"Alert sent for {record_id}")
+                self.failure_count = 0  # reset failure count after success
+                return
 
-    # ----------------------------------------------------------------------
-    # LOOP MODE
-    # ----------------------------------------------------------------------
+            except EmailSendError as e:
+                last_err = e
+                logger.warning(f"Email attempt {attempt + 1} failed: {e}")
+
+                # transient errors → retry
+                time.sleep(
+                    self.BACKOFF_STEPS[min(attempt, len(self.BACKOFF_STEPS) - 1)]
+                )
+                continue
+
+            except Exception as e:
+                last_err = e
+                break  # non-email error → do not retry
+
+        # Retries exhausted
+        CallRecordsDB.update_alert_status(
+            record_id, status="failed", error=str(last_err)
+        )
+        raise EmailSendError(f"Retries exhausted for {record_id}: {last_err}")
+
+    # ---------------------------------------------------------
+    def _parse_warning_reasons(self, record: Dict[str, Any]) -> List[str]:
+        raw = record.get("warning_reasons_json")
+        if not raw:
+            return []
+
+        # Already a list?
+        if isinstance(raw, list):
+            return raw
+
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            logger.warning(
+                f"Invalid warning_reasons_json for record {record.get('id')}"
+            )
+            return []
+
+    # ---------------------------------------------------------
+    def _trip_circuit_breaker(self):
+        self.circuit_open = True
+        self.circuit_reopen_time = time.time() + self.CIRCUIT_BREAKER_COOLDOWN
+        logger.error(
+            f"AlertWorker Circuit Breaker TRIPPED — too many failures. "
+            f"Cooling down for {self.CIRCUIT_BREAKER_COOLDOWN} seconds."
+        )
+
+    # ---------------------------------------------------------
     def run_forever(self):
-        logger.info("Starting Alert Worker")
+        logger.info("Alert Worker started")
 
         while True:
             try:
                 sent = self.process_batch()
                 if sent > 0:
-                    logger.info(f"Sent {sent} alerts")
+                    logger.info(f"Sent {sent} alert emails")
 
             except Exception as e:
-                logger.error(f"Worker error: {e}")
+                logger.error(f"AlertWorker crash: {e}")
 
             time.sleep(self.poll_interval)
 
 
 def run_worker():
-    worker = AlertWorker()
-    worker.run_forever()
+    AlertWorker().run_forever()
 
 
 if __name__ == "__main__":

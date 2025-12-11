@@ -1,20 +1,15 @@
 # src/workers/analysis_worker.py
 """
-Unified Analysis Worker — Single Gemini Call.
-
-Processes pending calls:
-1. Downloads audio from recording_url
-2. Uploads to Gemini Files API
-3. Analyzes with single Gemini call
-4. Saves results to database
+Analysis Worker — Production Version
 """
 
 import logging
 import time
 import tempfile
-import httpx
 from pathlib import Path
 from typing import Dict, Any
+
+import httpx
 
 from ..config import settings
 from ..services.call_analyzer import CallAnalyzer, CallAnalysisError
@@ -24,183 +19,144 @@ logger = logging.getLogger(__name__)
 
 
 class AnalysisWorker:
-    """
-    Unified background worker for analyzing calls.
-
-    Flow:
-      1. Find records with analysis_status='pending'
-      2. Download audio from recording_url (if available)
-      3. Analyze with single Gemini call
-      4. Save results to database
-    """
+    MAX_DOWNLOAD_RETRIES = 3
+    DOWNLOAD_BACKOFF = [1, 2, 5]
 
     def __init__(self):
         self.analyzer = CallAnalyzer()
         self.batch_size = settings.WORKER_BATCH_SIZE
         self.poll_interval = settings.WORKER_POLL_INTERVAL_SECONDS
 
-    # ------------------------------------------------------------------
-    # PROCESS BATCH
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------
     def process_batch(self) -> int:
         try:
             pending = CallRecordsDB.find_pending_analysis(self.batch_size)
         except DatabaseError as e:
-            logger.error(f"Database error: {e}")
+            logger.error(f"Database error fetching records: {e}")
             return 0
 
         if not pending:
-            logger.debug("No pending analysis tasks")
             return 0
 
-        logger.info(f"Processing {len(pending)} pending analyses")
+        logger.info(f"Found {len(pending)} calls needing analysis")
         processed = 0
 
         for record in pending:
             record_id = record["id"]
 
             try:
-                # Mark as processing
                 CallRecordsDB.update_analysis_status(record_id, "processing")
-
                 self._process_record(record)
                 processed += 1
 
             except Exception as e:
-                logger.error(f"Failed to analyze {record_id}: {e}")
-
+                logger.error(f"Record {record_id} analysis failed: {e}")
                 try:
                     CallRecordsDB.update_analysis(
                         record_id, status="failed", error=str(e)
                     )
-                except Exception as db_err:
-                    logger.error(f"Failed to update failure status: {db_err}")
+                except Exception:
+                    logger.error("Unable to update DB failure status")
 
         return processed
 
-    # ------------------------------------------------------------------
-    # PROCESS SINGLE RECORD
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------
     def _process_record(self, record: Dict[str, Any]):
         record_id = record["id"]
         recording_url = record.get("recording_url")
         agent_name = record.get("agent_name")
         local_file = record.get("local_audio_path")
 
-        logger.info(f"Analyzing record {record_id}")
+        logger.info(f"Processing record {record_id}")
 
-        # Determine audio source
-        audio_path = None
-
+        # determine audio source
         if local_file and Path(local_file).exists():
-            # Use local file if available
             audio_path = local_file
-            logger.info(f"Using local file: {audio_path}")
-
         elif recording_url:
-            # Download from URL
             audio_path = self._download_audio(record_id, recording_url)
-            logger.info(f"Downloaded audio to: {audio_path}")
-
         else:
-            # Fallback: try transcript if available
             transcript = record.get("transcript_text")
             if transcript and len(transcript) > 20:
-                logger.info("Using existing transcript for analysis")
+                logger.info(f"Record {record_id}: Using transcript fallback")
                 analysis = self.analyzer.analyze(
-                    transcript=transcript,
+                    transcript,
                     language_detected=record.get("language_detected"),
                     agent_name=agent_name,
                 )
                 self._save_analysis(record_id, analysis)
                 return
-            else:
-                raise CallAnalysisError("No audio or transcript available")
+            raise CallAnalysisError("No audio or transcript available")
 
-        # Analyze audio with Gemini
-        analysis = self.analyzer.analyze_audio(
-            audio_path=audio_path,
-            agent_name=agent_name,
-        )
-
+        # run Gemini analysis
+        analysis = self.analyzer.analyze_audio(audio_path, agent_name)
         self._save_analysis(record_id, analysis)
 
-        # Clean up temp file
-        if recording_url and audio_path:
+        # cleanup temp files
+        if recording_url and audio_path and audio_path.startswith("/tmp"):
             try:
                 Path(audio_path).unlink()
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # DOWNLOAD AUDIO
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------
     def _download_audio(self, record_id: str, url: str) -> str:
-        """Download audio from URL to temp file."""
-        logger.info(f"Downloading audio for {record_id}")
+        logger.info(f"Downloading audio for {record_id} → {url}")
 
-        try:
-            with httpx.Client(timeout=120) as client:
-                response = client.get(url)
-                response.raise_for_status()
+        last_err = None
 
-            # Determine file extension
-            content_type = response.headers.get("content-type", "")
-            if "audio/mpeg" in content_type or url.endswith(".mp3"):
-                ext = ".mp3"
-            elif "audio/wav" in content_type or url.endswith(".wav"):
-                ext = ".wav"
-            elif "audio/mp4" in content_type or url.endswith(".m4a"):
-                ext = ".m4a"
-            else:
-                ext = ".mp3"  # Default
+        for attempt in range(self.MAX_DOWNLOAD_RETRIES):
+            try:
+                with httpx.Client(timeout=60) as client:
+                    resp = client.get(url)
+                    resp.raise_for_status()
 
-            # Save to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                tmp.write(response.content)
-                return tmp.name
+                if len(resp.content) < 2000:
+                    raise CallAnalysisError("Downloaded audio file is too small")
 
-        except Exception as e:
-            raise CallAnalysisError(f"Failed to download audio: {e}")
+                ext = self._infer_extension(url, resp.headers.get("content-type", ""))
 
-    # ------------------------------------------------------------------
-    # SAVE ANALYSIS
-    # ------------------------------------------------------------------
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(resp.content)
+                    return tmp.name
+
+            except Exception as e:
+                last_err = e
+                logger.error(f"Download failed (attempt {attempt+1}): {e}")
+
+            time.sleep(
+                self.DOWNLOAD_BACKOFF[min(attempt, len(self.DOWNLOAD_BACKOFF) - 1)]
+            )
+
+        raise CallAnalysisError(f"Audio download retries exhausted: {last_err}")
+
+    # ----------------------------------------------------
+    def _infer_extension(self, url: str, content_type: str) -> str:
+        if "mp3" in content_type or url.endswith(".mp3"):
+            return ".mp3"
+        if "wav" in content_type or url.endswith(".wav"):
+            return ".wav"
+        if "m4a" in content_type or url.endswith(".m4a"):
+            return ".m4a"
+        return ".mp3"
+
+    # ----------------------------------------------------
     def _save_analysis(self, record_id: str, analysis: dict):
-        """Save analysis results to database."""
-        CallRecordsDB.update_analysis(
-            record_id,
-            analysis=analysis,
-            status="success",
-        )
+        CallRecordsDB.update_analysis(record_id, analysis=analysis, status="success")
 
-        logger.info(
-            f"Analysis complete: {record_id} — "
-            f"score={analysis['overall_score']}, warning={analysis['has_warning']}"
-        )
-
-    # ------------------------------------------------------------------
-    # LOOP MODE
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------
     def run_forever(self):
-        logger.info("Starting Analysis Worker (Single Gemini Call Mode)")
+        logger.info("Analysis Worker started")
 
         while True:
             try:
-                processed = self.process_batch()
-                if processed > 0:
-                    logger.info(f"Processed {processed} analyses")
+                count = self.process_batch()
+                if count:
+                    logger.info(f"Processed {count} calls")
             except Exception as e:
-                logger.error(f"Worker error: {e}")
+                logger.error(f"Worker crash: {e}")
 
             time.sleep(self.poll_interval)
 
 
 def run_worker():
-    worker = AnalysisWorker()
-    worker.run_forever()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    run_worker()
+    AnalysisWorker().run_forever()
