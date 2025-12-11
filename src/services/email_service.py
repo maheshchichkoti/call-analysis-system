@@ -210,15 +210,31 @@ class EmailService:
 
     # ---------------------------------------------------------
     def _build_html_body(self, call_data: Dict[str, Any]) -> str:
-        """(HTML builder unchanged except cleaned/escaped values)"""
+        """Build HTML email body with proper styling."""
 
         agent = _safe_text(call_data.get("agent_name"))
         warnings = _safe_list(call_data.get("warning_reasons"))
         summary = _safe_text(call_data.get("short_summary"))
         customer = _safe_text(call_data.get("customer_number"))
-        score = call_data.get("overall_score", "N/A")
+        score = call_data.get("overall_score")
         sentiment = _safe_text(call_data.get("customer_sentiment"))
-        duration = call_data.get("duration_seconds") or 0
+        duration = call_data.get("duration_seconds")
+
+        # Format duration (handle None/0)
+        if duration and duration > 0:
+            duration_str = f"{duration // 60}m {duration % 60}s"
+        else:
+            duration_str = "N/A"
+
+        # Score color coding
+        if score and score >= 4:
+            score_color = "#16a34a"  # green
+        elif score and score == 3:
+            score_color = "#f59e0b"  # yellow/orange
+        else:
+            score_color = "#dc2626"  # red
+
+        score_display = f"{score}/5" if score else "N/A"
 
         warnings_html = (
             "<ul>" + "".join(f"<li>{_safe_text(w)}</li>" for w in warnings) + "</ul>"
@@ -241,9 +257,9 @@ class EmailService:
 
 <p><b>Agent:</b> {agent}</p>
 <p><b>Customer:</b> {customer}</p>
-<p><b>Score:</b> <span style="color:#dc2626">{score}</span></p>
+<p><b>Score:</b> <span style="color:{score_color};font-weight:bold">{score_display}</span></p>
 <p><b>Sentiment:</b> <span style="color:{sentiment_color}">{sentiment}</span></p>
-<p><b>Duration:</b> {duration//60}m {duration%60}s</p>
+<p><b>Duration:</b> {duration_str}</p>
 
 <h3>Warnings</h3>
 {warnings_html}

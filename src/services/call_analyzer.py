@@ -5,7 +5,6 @@ Gemini Call Analyzer — Production-Stable Version
 
 import json
 import logging
-import re
 import time
 from pathlib import Path
 from typing import TypedDict, Literal, List, Optional
@@ -37,10 +36,34 @@ class CallAnalysisError(Exception):
 # -------------------------------
 # DEFAULT PROMPT
 # -------------------------------
-DEFAULT_PROMPT = """You are an expert call center quality analyst...
+DEFAULT_PROMPT = """You are an expert call center quality analyst. Analyze this customer call.
 
-(unchanged — keep your original prompt here)
-"""
+TASK: Evaluate the AGENT's performance and provide a JSON response.
+
+SCORING (1-5):
+• 5 = Excellent: Professional, helpful, customer satisfied
+• 4 = Good: Professional with minor gaps
+• 3 = Average: Adequate but noticeable issues
+• 2 = Below Average: Unprofessional or unhelpful
+• 1 = Poor: Major issues, customer frustrated
+
+WARNING FLAGS (only if applicable):
+- rude_agent, unresolved_issue, customer_angry, lack_of_empathy, escalation_needed
+
+RULES:
+- Focus on AGENT behavior, not customer
+- Summary in English, 1-3 sentences max
+- Be concise and accurate
+
+OUTPUT (JSON only):
+{
+  "overall_score": 3,
+  "has_warning": false,
+  "warning_reasons": [],
+  "short_summary": "Brief summary here.",
+  "customer_sentiment": "neutral",
+  "department": "support"
+}"""
 
 
 # -------------------------------

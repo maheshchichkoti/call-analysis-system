@@ -96,14 +96,16 @@ async def zoom_webhook(
 
     logger.info(f"Received Zoom event: {event_type}")
 
-    # Duplicate protection
+    # Duplicate protection (check BEFORE adding!)
     event_id = f"{x_zm_request_timestamp}:{hash(body)}"
-    RECENT_EVENTS[event_id] = time.time()
     clean_old_events()
 
     if event_id in RECENT_EVENTS:
         logger.info("Duplicate event received — ignoring")
         return {"status": "duplicate"}
+
+    # Add to cache AFTER checking
+    RECENT_EVENTS[event_id] = time.time()
 
     # Process the event
     if event_type == "phone.recording_completed":

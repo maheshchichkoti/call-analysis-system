@@ -5,17 +5,23 @@ import hashlib
 import json
 import requests
 
+# UPDATE THIS URL to your current ngrok/server URL
 WEBHOOK_URL = "https://7cf1a050b896.ngrok-free.app/webhook/zoom"
 SECRET = "y89hMD-cQuy5r-yOoJz6IQ"  # must match settings.ZOOM_WEBHOOK_SECRET_TOKEN on the server
+
+# Generate unique call_id to avoid database duplicate checks
+unique_call_id = f"test_{int(time.time())}"
 
 body = {
     "event": "phone.recording_completed",
     "payload": {
         "object": {
-            "call_id": "test471",
+            "call_id": unique_call_id,
             "download_url": "https://nlswzwucccjhsebkaczn.supabase.co/storage/v1/object/public/test/ClassAudio(2).mp3",
             "caller": {"phone_number": "+1234567890"},
             "callee": {"name": "Test Agent"},
+            "duration": 185,  # 3 minutes 5 seconds
+            "date_time": "2025-12-11T12:30:00Z",
         }
     },
 }

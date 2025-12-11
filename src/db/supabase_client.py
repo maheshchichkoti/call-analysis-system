@@ -230,3 +230,35 @@ class CallRecordsDB:
         sb = cls.client()
         resp = sb.table("call_records").select("*").eq("call_id", call_id).execute()
         return resp.data[0] if resp.data else None
+
+    @classmethod
+    @retry("list_calls")
+    def list_calls(
+        cls,
+        limit: int = 50,
+        offset: int = 0,
+        analysis_status: Optional[str] = None,
+        warnings_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Paginated, filterable list of calls for the dashboard.
+        """
+        sb = cls.client()
+        query = sb.table("call_records").select(
+            "id, call_id, agent_name, customer_number, start_time, "
+            "duration_seconds, overall_score, customer_sentiment, "
+            "has_warning, analysis_status, alert_email_status, created_at"
+        )
+
+        if analysis_status:
+            query = query.eq("analysis_status", analysis_status)
+
+        if warnings_only:
+            query = query.eq("has_warning", True)
+
+        resp = (
+            query.order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        return resp.data or []
