@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Call Analysis Dashboard</title>
+    <style>
+      :root {
+        --primary: #6366f1;
+        --primary-dark: #4f46e5;
+        --success: #22c55e;
+        --warning: #f59e0b;
+        --danger: #ef4444;
+        --bg: #0f172a;
+        --card: #1e293b;
+        --text: #f1f5f9;
+        --text-muted: #94a3b8;
+        --border: #334155;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.6;
+      }
+
+      .container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      /* Header */
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 32px;
+      }
+
+      h1 {
+        font-size: 1.75rem;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .refresh-btn {
+        background: var(--primary);
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 500;
+        transition: background 0.2s;
+      }
+
+      .refresh-btn:hover {
+        background: var(--primary-dark);
+      }
+
+      /* Stats Grid */
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 16px;
+        margin-bottom: 32px;
+      }
+
+      .stat-card {
+        background: var(--card);
+        border-radius: 12px;
+        padding: 20px;
+        border: 1px solid var(--border);
+      }
+
+      .stat-label {
+        font-size: 0.875rem;
+        color: var(--text-muted);
+        margin-bottom: 8px;
+      }
+
+      .stat-value {
+        font-size: 2rem;
+        font-weight: 700;
+      }
+
+      /* Calls Table */
+      .calls-section {
+        background: var(--card);
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        overflow: hidden;
+      }
+
+      .section-header {
+        padding: 16px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .section-title {
+        font-size: 1.125rem;
+        font-weight: 600;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 12px 16px;
+        text-align: left;
+        border-bottom: 1px solid var(--border);
+      }
+
+      th {
+        background: #0f172a;
+        font-weight: 600;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-muted);
+      }
+
+      tr:hover {
+        background: rgba(99, 102, 241, 0.1);
+      }
+
+      /* Badges */
+      .badge {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .badge-success {
+        background: rgba(34, 197, 94, 0.2);
+        color: var(--success);
+      }
+      .badge-warning {
+        background: rgba(245, 158, 11, 0.2);
+        color: var(--warning);
+      }
+      .badge-danger {
+        background: rgba(239, 68, 68, 0.2);
+        color: var(--danger);
+      }
+      .badge-neutral {
+        background: rgba(148, 163, 184, 0.2);
+        color: var(--text-muted);
+      }
+
+      /* Score */
+      .score {
+        font-weight: 700;
+      }
+
+      .score-5,
+      .score-4 {
+        color: var(--success);
+      }
+      .score-3 {
+        color: var(--warning);
+      }
+      .score-2,
+      .score-1 {
+        color: var(--danger);
+      }
+
+      /* Warning indicator */
+      .warning-flag {
+        color: var(--danger);
+        font-weight: 600;
+      }
+
+      /* Loading */
+      .loading {
+        text-align: center;
+        padding: 40px;
+        color: var(--text-muted);
+      }
+
+      /* Empty state */
+      .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: var(--text-muted);
+      }
+
+      /* Modal */
+      .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        display: none;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      }
+
+      .modal-overlay.active {
+        display: flex;
+      }
+
+      .modal {
+        background: var(--card);
+        border-radius: 16px;
+        padding: 24px;
+        max-width: 600px;
+        width: 90%;
+        max-height: 80vh;
+        overflow-y: auto;
+      }
+
+      .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 20px;
+      }
+
+      .modal-close {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        font-size: 1.5rem;
+        cursor: pointer;
+      }
+
+      .detail-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 12px 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .detail-label {
+        color: var(--text-muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>🎧 Call Analysis Dashboard</h1>
+        <button class="refresh-btn" onclick="loadData()">↻ Refresh</button>
+      </header>
+
+      <!-- Stats -->
+      <div class="stats-grid" id="stats">
+        <div class="stat-card">
+          <div class="stat-label">Total Calls</div>
+          <div class="stat-value" id="stat-total">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Avg Score</div>
+          <div class="stat-value" id="stat-avg">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Warnings</div>
+          <div class="stat-value" id="stat-warnings">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Today</div>
+          <div class="stat-value" id="stat-today">—</div>
+        </div>
+      </div>
+
+      <!-- Calls Table -->
+      <div class="calls-section">
+        <div class="section-header">
+          <h2 class="section-title">Recent Calls</h2>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Agent</th>
+              <th>Customer</th>
+              <th>Score</th>
+              <th>Sentiment</th>
+              <th>Warning</th>
+              <th>Status</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody id="calls-body">
+            <tr>
+              <td colspan="7" class="loading">Loading...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Detail Modal -->
+    <div class="modal-overlay" id="modal" onclick="closeModal(event)">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Call Details</h3>
+          <button class="modal-close" onclick="closeModal()">&times;</button>
+        </div>
+        <div id="modal-content"></div>
+      </div>
+    </div>
+
+    <script>
+      const API_BASE = "/api";
+
+      async function loadData() {
+        loadStats();
+        loadCalls();
+      }
+
+      async function loadStats() {
+        try {
+          const res = await fetch(`${API_BASE}/stats`);
+          const stats = await res.json();
+
+          document.getElementById("stat-total").textContent = stats.total_calls;
+          document.getElementById("stat-avg").textContent =
+            stats.avg_score.toFixed(1);
+          document.getElementById("stat-warnings").textContent =
+            stats.warning_count;
+          document.getElementById("stat-today").textContent = stats.calls_today;
+        } catch (err) {
+          console.error("Failed to load stats:", err);
+        }
+      }
+
+      async function loadCalls() {
+        const tbody = document.getElementById("calls-body");
+
+        try {
+          const res = await fetch(`${API_BASE}/calls?limit=50`);
+          const calls = await res.json();
+
+          if (calls.length === 0) {
+            tbody.innerHTML =
+              '<tr><td colspan="7" class="empty-state">No calls yet</td></tr>';
+            return;
+          }
+
+          tbody.innerHTML = calls
+            .map(
+              (call) => `
+                    <tr onclick="showDetail('${
+                      call.id
+                    }')" style="cursor: pointer">
+                        <td>${call.agent_name || "—"}</td>
+                        <td>${call.customer_number || "—"}</td>
+                        <td class="score score-${call.overall_score}">${
+                call.overall_score || "—"
+              }/5</td>
+                        <td>${getSentimentEmoji(call.customer_sentiment)} ${
+                call.customer_sentiment || "—"
+              }</td>
+                        <td>${
+                          call.has_warning
+                            ? '<span class="warning-flag">⚠️ Yes</span>'
+                            : "✓"
+                        }</td>
+                        <td><span class="badge badge-${getStatusClass(
+                          call.analysis_status
+                        )}">${call.analysis_status || "pending"}</span></td>
+                        <td>${formatDate(call.created_at)}</td>
+                    </tr>
+                `
+            )
+            .join("");
+        } catch (err) {
+          console.error("Failed to load calls:", err);
+          tbody.innerHTML =
+            '<tr><td colspan="7" class="loading">Failed to load</td></tr>';
+        }
+      }
+
+      async function showDetail(id) {
+        const modal = document.getElementById("modal");
+        const content = document.getElementById("modal-content");
+
+        content.innerHTML = '<p class="loading">Loading...</p>';
+        modal.classList.add("active");
+
+        try {
+          const res = await fetch(`${API_BASE}/calls/${id}`);
+          const call = await res.json();
+
+          content.innerHTML = `
+                    <div class="detail-row"><span class="detail-label">Agent</span><span>${
+                      call.agent_name || "—"
+                    }</span></div>
+                    <div class="detail-row"><span class="detail-label">Customer</span><span>${
+                      call.customer_number || "—"
+                    }</span></div>
+                    <div class="detail-row"><span class="detail-label">Score</span><span class="score score-${
+                      call.overall_score
+                    }">${call.overall_score}/5</span></div>
+                    <div class="detail-row"><span class="detail-label">Sentiment</span><span>${getSentimentEmoji(
+                      call.customer_sentiment
+                    )} ${call.customer_sentiment}</span></div>
+                    <div class="detail-row"><span class="detail-label">Department</span><span>${
+                      call.department || "—"
+                    }</span></div>
+                    <div class="detail-row"><span class="detail-label">Warning</span><span>${
+                      call.has_warning ? "⚠️ Yes" : "✓ No"
+                    }</span></div>
+                    ${
+                      call.warning_reasons_json
+                        ? `<div class="detail-row"><span class="detail-label">Reasons</span><span>${call.warning_reasons_json}</span></div>`
+                        : ""
+                    }
+                    <div class="detail-row"><span class="detail-label">Summary</span></div>
+                    <p style="padding: 12px 0; color: var(--text-muted)">${
+                      call.short_summary || "No summary"
+                    }</p>
+                `;
+        } catch (err) {
+          content.innerHTML = '<p class="loading">Failed to load details</p>';
+        }
+      }
+
+      function closeModal(event) {
+        if (event && event.target !== event.currentTarget) return;
+        document.getElementById("modal").classList.remove("active");
+      }
+
+      function getSentimentEmoji(sentiment) {
+        return (
+          { positive: "😊", neutral: "😐", negative: "😠" }[sentiment] || "❓"
+        );
+      }
+
+      function getStatusClass(status) {
+        return (
+          {
+            success: "success",
+            failed: "danger",
+            pending: "neutral",
+            processing: "warning",
+          }[status] || "neutral"
+        );
+      }
+
+      function formatDate(iso) {
+        if (!iso) return "—";
+        return new Date(iso).toLocaleDateString("en-US", {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+      }
+
+      // Initial load
+      loadData();
+
+      // Auto-refresh every 30s
+      setInterval(loadData, 30000);
+    </script>
+  </body>
+</html>

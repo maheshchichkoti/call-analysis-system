@@ -63,7 +63,7 @@ class CallRecordsDB:
             "end_time": call_data.get("end_time"),
             "duration_seconds": call_data.get("duration_seconds"),
             "recording_url": call_data.get("recording_url"),
-            "transcription_status": "pending",
+            "local_audio_path": call_data.get("local_audio_path"),
             "analysis_status": "pending",
             "alert_email_status": "pending",
         }
@@ -101,17 +101,25 @@ class CallRecordsDB:
 
     @classmethod
     def find_pending_analysis(cls, limit=5) -> List[Dict[str, Any]]:
+        """Find records with pending analysis (no transcription step needed)."""
         sb = cls.client()
         resp = (
             sb.table("call_records")
             .select("*")
-            .eq("transcription_status", "success")
             .eq("analysis_status", "pending")
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
         return resp.data or []
+
+    @classmethod
+    def update_analysis_status(cls, record_id: str, status: str):
+        """Quick status update for locking records."""
+        sb = cls.client()
+        sb.table("call_records").update({"analysis_status": status}).eq(
+            "id", record_id
+        ).execute()
 
     @classmethod
     def find_pending_alerts(cls, limit=5) -> List[Dict[str, Any]]:
@@ -243,3 +251,10 @@ class CallRecordsDB:
             sb.table("call_records").select("*").eq("id", record_id).single().execute()
         )
         return resp.data
+
+    @classmethod
+    def get_call_by_call_id(cls, call_id: str) -> Optional[Dict[str, Any]]:
+        """Get call by external call_id (e.g., Zoom call ID)."""
+        sb = cls.client()
+        resp = sb.table("call_records").select("*").eq("call_id", call_id).execute()
+        return resp.data[0] if resp.data else None

@@ -1,0 +1,55 @@
+# Ignore Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files (keep them out of image)
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+
+# Test files
+tests/
+*.test.py
+test_*.py
+
+# Audio files (too large for image)
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.flac
+
+# Output files
+*.json
+*.log
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+README.md
+docs/
+*.md
+
+# Misc
+.DS_Store
+Thumbs.db

@@ -1,0 +1,37 @@
+# Docker Compose for Call Analysis System
+# Runs both API server and background workers
+
+version: "3.8"
+
+services:
+  # API Server (FastAPI + Dashboard)
+  api:
+    build: .
+    container_name: call-analysis-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Background Workers (Analysis + Alerts)
+  workers:
+    build: .
+    container_name: call-analysis-workers
+    command: python run_workers.py
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy

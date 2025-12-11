@@ -1,18 +1,17 @@
 # src/services/email_service.py
 """
-Resend Email Service (HARDENED PRODUCTION VERSION)
+SMTP Email Service — Production Version
 
-✔ Keeps your full HTML design
-✔ Sanitizes all user-provided text (prevents HTML injection)
-✔ Handles long transcripts safely
-✔ Ensures warnings are always array[str]
-✔ Strong error handling for worker stability
+Sends alert emails via SMTP (your company email server).
+Supports Gmail, Outlook, or any SMTP server.
 """
 
 import logging
+import smtplib
 import html
-from typing import Optional, Dict, Any, List
-import resend
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Dict, Any, List, Optional
 
 from ..config import settings
 
@@ -54,17 +53,19 @@ def _safe_list(value) -> List[str]:
 class EmailService:
     """
     Sends styled alert emails for calls with warnings.
+    Uses SMTP (your company email server).
     """
 
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or settings.RESEND_API_KEY
-        self.from_email = settings.RESEND_FROM_EMAIL
+    def __init__(self):
+        self.smtp_host = settings.SMTP_HOST
+        self.smtp_port = settings.SMTP_PORT
+        self.smtp_user = settings.SMTP_USER
+        self.smtp_password = settings.SMTP_PASSWORD
+        self.from_email = settings.SMTP_FROM_EMAIL or self.smtp_user
         self.default_to = settings.CALL_ALERT_TARGET_EMAIL
 
-        if not self.api_key:
-            raise EmailError("RESEND_API_KEY not set")
-
-        resend.api_key = self.api_key
+        if not self.smtp_host or not self.smtp_user:
+            logger.warning("SMTP not fully configured - emails will be disabled")
 
     # ----------------------------------------------------------------------
     # PUBLIC SEND METHOD
@@ -77,6 +78,9 @@ class EmailService:
         if not recipient:
             raise EmailError("Target email is missing")
 
+        if not self.smtp_host or not self.smtp_user:
+            raise EmailError("SMTP not configured")
+
         logger.info(f"Sending call alert email → {recipient}")
 
         subject = self._build_subject(call_data)
@@ -84,21 +88,24 @@ class EmailService:
         text_body = self._build_text_body(call_data)
 
         try:
-            result = resend.Emails.send(
-                {
-                    "from": self.from_email,
-                    "to": recipient,
-                    "subject": subject,
-                    "html": html_body,
-                    "text": text_body,
-                }
-            )
+            # Create message
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = self.from_email
+            msg["To"] = recipient
 
-            if isinstance(result, dict) and result.get("id"):
-                logger.info(f"Email sent successfully (id={result['id']})")
-                return result
+            # Attach text and HTML versions
+            msg.attach(MIMEText(text_body, "plain"))
+            msg.attach(MIMEText(html_body, "html"))
 
-            raise EmailError(f"Unexpected Resend response: {result}")
+            # Send via SMTP
+            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.smtp_user, self.smtp_password)
+                server.send_message(msg)
+
+            logger.info("Email sent successfully!")
+            return {"status": "sent", "to": recipient}
 
         except Exception as e:
             logger.error(f"Email sending failed: {e}")
@@ -112,8 +119,7 @@ class EmailService:
         warnings = _safe_list(call_data.get("warning_reasons"))
 
         if warnings:
-            warn_str = ", ".join(warnings[:3])
-            warn_str = warn_str[:80]  # prevent over-long subjects
+            warn_str = ", ".join(warnings[:3])[:80]
             return f"⚠️ Call Alert – {agent} – {warn_str}"
 
         return f"⚠️ Call Alert – {agent}"
@@ -123,7 +129,6 @@ class EmailService:
     # ----------------------------------------------------------------------
     def _build_html_body(self, call_data: Dict[str, Any]) -> str:
 
-        # SAFELY EXTRACT DATA
         agent = _safe_text(call_data.get("agent_name"))
         agent_id = _safe_text(call_data.get("agent_id"))
         customer = _safe_text(call_data.get("customer_number"))
@@ -134,22 +139,10 @@ class EmailService:
         summary = _safe_text(call_data.get("short_summary"))
         warnings = _safe_list(call_data.get("warning_reasons"))
 
-        # TRANSCRIPT (safely truncated + escaped)
-        transcript_raw = call_data.get("transcript_text", "") or ""
-        transcript_clean = _safe_text(transcript_raw[:3000])
-        transcript_html = (
-            f"<div class='section'><div class='section-title'>📜 Full Transcript</div>"
-            f"<div class='transcript'>{transcript_clean}"
-            f"{'...' if len(transcript_raw) > 3000 else ''}</div></div>"
-            if transcript_raw
-            else ""
-        )
-
-        # Duration formatting
         dur = call_data.get("duration_seconds") or 0
         duration_str = f"{dur // 60}m {dur % 60}s"
 
-        # WARNING LIST HTML
+        # Warning list HTML
         if warnings:
             items = "".join(f"<li>{_safe_text(w)}</li>" for w in warnings)
             warnings_html = f"<ul style='color:#dc2626'>{items}</ul>"
@@ -161,13 +154,18 @@ class EmailService:
             "positive": "#16a34a",
             "neutral": "#6b7280",
             "negative": "#dc2626",
-        }.get(sentiment.lower(), "#6b7280")
+        }.get(str(sentiment).lower(), "#6b7280")
 
-        score_color = (
-            "#16a34a" if score >= 4 else "#f59e0b" if score >= 3 else "#dc2626"
-        )
+        try:
+            score_val = int(score)
+            score_color = (
+                "#16a34a"
+                if score_val >= 4
+                else "#f59e0b" if score_val >= 3 else "#dc2626"
+            )
+        except:
+            score_color = "#6b7280"
 
-        # FINAL HTML
         return f"""
 <!DOCTYPE html>
 <html>
@@ -179,8 +177,7 @@ body {{ font-family: Arial, sans-serif; background:#fafafa; }}
 .header {{ background:#991b1b; color:white; padding:20px; border-radius:8px 8px 0 0; }}
 .section {{ padding:15px; border-bottom:1px solid #eee; }}
 .section-title {{ font-weight:bold; margin-bottom:8px; }}
-.transcript {{ white-space:pre-wrap; background:#f3f4f6; padding:10px; border-radius:6px; }}
-.metric {{ display:inline-block; margin:4px; }}
+.metric {{ display:inline-block; margin:4px 10px 4px 0; }}
 </style>
 </head>
 <body>
@@ -202,7 +199,6 @@ body {{ font-family: Arial, sans-serif; background:#fafafa; }}
   <div class="section-title">📋 Call Details</div>
   <div><b>Customer:</b> {customer}</div>
   <div><b>Start:</b> {start_time}</div>
-  <div><b>End:</b> {end_time}</div>
   <div><b>Agent ID:</b> {agent_id}</div>
 </div>
 
@@ -215,8 +211,6 @@ body {{ font-family: Arial, sans-serif; background:#fafafa; }}
   <div class="section-title">📝 Summary</div>
   <div>{summary}</div>
 </div>
-
-{transcript_html}
 
 </div>
 </body>
@@ -231,12 +225,10 @@ body {{ font-family: Arial, sans-serif; background:#fafafa; }}
         agent = call_data.get("agent_name", "Unknown")
         customer = call_data.get("customer_number", "N/A")
         start = call_data.get("start_time", "N/A")
-        end = call_data.get("end_time", "N/A")
         score = call_data.get("overall_score", "N/A")
         sentiment = call_data.get("customer_sentiment", "N/A")
         warnings = _safe_list(call_data.get("warning_reasons"))
         summary = call_data.get("short_summary", "")
-        transcript = (call_data.get("transcript_text") or "")[:1000]
 
         warnings_str = ", ".join(warnings) if warnings else "None"
 
@@ -245,7 +237,7 @@ CALL ALERT
 
 Agent: {agent}
 Customer: {customer}
-Time: {start} → {end}
+Time: {start}
 Score: {score}/5
 Sentiment: {sentiment}
 
@@ -254,9 +246,6 @@ Warnings:
 
 Summary:
 {summary}
-
-Transcript (truncated):
-{transcript}
 """.strip()
 
 

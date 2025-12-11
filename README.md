@@ -1,57 +1,92 @@
 # Call Analysis System
 
-A production-ready system that:
-
-1. Transcribes Zoom Phone call recordings (Hebrew/Arabic)
-2. Analyzes transcripts with Gemini AI for scoring and warnings
-3. Sends email alerts for warning calls
-
-## Quick Start (Demo)
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Copy .env.example to .env and fill in your keys
-cp .env.example .env
-
-# 3. Run the demo with a sample audio file
-python demo.py --audio path/to/your/audio.m4a
-```
+AI-powered call quality analysis using **Gemini 2.0 Flash** — Single API call for audio analysis.
 
 ## Features
 
-- **Transcription**: AssemblyAI with Hebrew/Arabic support
-- **AI Analysis**: Gemini 1.5 Flash for cost-effective analysis
-- **Email Alerts**: Resend API for reliable email delivery
-- **Configurable Prompts**: Analysis prompt via environment variable
-- **Production Ready**: Error handling, logging, retry logic
+- 🎧 **Single Gemini Call** — Upload audio, get analysis (no separate transcription)
+- 📊 **Quality Scoring** — 1-5 score with detailed breakdown
+- ⚠️ **Warning Detection** — Automatic flagging of concerning calls
+- 📧 **Email Alerts** — SMTP-based notifications for flagged calls
+- 🎯 **Zoom Phone Integration** — Webhook support for automatic capture
+- 📱 **Admin Dashboard** — Real-time call monitoring UI
+- 🐳 **Docker Ready** — One command deployment
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your API keys
+
+# Test system
+python test_system.py
+
+# Run demo
+python demo.py --audio call.mp3
+```
+
+## Production Deployment
+
+```bash
+# With Docker
+docker-compose up -d
+
+# Or manually
+python main.py &          # API server
+python run_workers.py &   # Background workers
+```
+
+## API Endpoints
+
+| Endpoint          | Method | Description          |
+| ----------------- | ------ | -------------------- |
+| `/`               | GET    | Dashboard UI         |
+| `/health`         | GET    | Health check         |
+| `/docs`           | GET    | API documentation    |
+| `/webhook/zoom`   | POST   | Zoom Phone webhook   |
+| `/api/calls`      | GET    | List recent calls    |
+| `/api/calls/{id}` | GET    | Get call details     |
+| `/api/stats`      | GET    | Dashboard statistics |
+
+## Architecture
+
+```
+Zoom Phone Call → Webhook → Supabase (pending)
+                              ↓
+                        Analysis Worker
+                              ↓
+                     Gemini 2.0 Flash (audio → JSON)
+                              ↓
+                     Supabase (results) → Email Alert (if warning)
+                              ↓
+                        Dashboard UI
+```
 
 ## Project Structure
 
 ```
 call-analysis-system/
-├── demo.py                 # Simple demo script
-├── run_workers.py          # Background worker runner
+├── main.py              # FastAPI server
+├── run_workers.py       # Background workers
+├── demo.py              # Demo script
+├── Dockerfile           # Docker build
+├── docker-compose.yml   # Docker orchestration
 ├── src/
-│   ├── config.py           # Configuration management
-│   ├── services/
-│   │   ├── transcription.py    # AssemblyAI transcription
-│   │   ├── call_analyzer.py    # Gemini AI analysis
-│   │   └── email_service.py    # Resend email alerts
-│   ├── workers/
-│   │   ├── transcription_worker.py
-│   │   ├── analysis_worker.py
-│   │   └── alert_worker.py
-│   ├── db/
-│   │   └── mysql_client.py     # Database operations
-│   └── api/
-│       └── webhooks.py         # Zoom webhook handler
-├── schema.sql              # Database schema
-├── requirements.txt
-└── .env.example
+│   ├── api/             # API routes
+│   ├── services/        # Business logic
+│   ├── workers/         # Background jobs
+│   └── db/              # Database client
+└── static/              # Dashboard UI
 ```
 
-## Environment Variables
+## Configuration
 
-See `.env.example` for all required configuration.
+See [.env.example](.env.example) for all available settings.
+
+## Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for cloud deployment instructions.

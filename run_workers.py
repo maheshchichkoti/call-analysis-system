@@ -1,155 +1,120 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-Worker Runner - Runs all background workers.
+Background Workers Runner — Production Ready
 
-Usage:
-    python run_workers.py                  # Run all workers
-    python run_workers.py --worker transcription  # Run specific worker
+Runs:
+  • AnalysisWorker
+  • AlertWorker
+
+Handles:
+  • Graceful shutdown (SIGINT/SIGTERM)
+  • Config validation
+  • Thread lifecycle management
 """
 
-import argparse
 import logging
-import signal
-import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+import signal
 
-# Configure logging
+from src.config import settings
+from src.workers.analysis_worker import AnalysisWorker
+from src.workers.alert_worker import AlertWorker
+
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(name)-20s | %(levelname)-7s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=getattr(logging, settings.LOG_LEVEL.upper()),
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
 )
-logger = logging.getLogger("worker_runner")
+logger = logging.getLogger("workers")
 
-# Graceful shutdown flag
 shutdown_event = threading.Event()
 
 
-def handle_shutdown(signum, frame):
-    """Handle shutdown signals."""
-    logger.info("Received shutdown signal, stopping workers...")
-    shutdown_event.set()
-
-
-def run_transcription_worker():
-    """Run transcription worker loop."""
-    from src.workers.transcription_worker import TranscriptionWorker
-    from src.config import settings
-
-    worker = TranscriptionWorker()
-    logger.info("Transcription worker started")
-
-    while not shutdown_event.is_set():
-        try:
-            worker.process_batch()
-        except Exception as e:
-            logger.error(f"Transcription worker error: {e}")
-
-        # Interruptible sleep
-        for _ in range(settings.WORKER_POLL_INTERVAL_SECONDS):
-            if shutdown_event.is_set():
-                break
-            time.sleep(1)
-
-    logger.info("Transcription worker stopped")
-
-
+# -------------------------------------------------------------------
+# WORKER WRAPPERS
+# -------------------------------------------------------------------
 def run_analysis_worker():
-    """Run analysis worker loop."""
-    from src.workers.analysis_worker import AnalysisWorker
-    from src.config import settings
-
     worker = AnalysisWorker()
-    logger.info("Analysis worker started")
+    logger.info("Analysis Worker started")
 
     while not shutdown_event.is_set():
         try:
-            worker.process_batch()
+            processed = worker.process_batch()
+            if processed:
+                logger.info(f"Processed {processed} calls")
         except Exception as e:
-            logger.error(f"Analysis worker error: {e}")
+            logger.exception(f"Analysis Worker error: {e}")
 
-        for _ in range(settings.WORKER_POLL_INTERVAL_SECONDS):
-            if shutdown_event.is_set():
-                break
-            time.sleep(1)
+        shutdown_event.wait(settings.WORKER_POLL_INTERVAL_SECONDS)
 
-    logger.info("Analysis worker stopped")
+    logger.info("Analysis Worker stopped")
 
 
 def run_alert_worker():
-    """Run alert worker loop."""
-    from src.workers.alert_worker import AlertWorker
-    from src.config import settings
-
     worker = AlertWorker()
-    logger.info("Alert worker started")
+    logger.info("Alert Worker started")
 
     while not shutdown_event.is_set():
         try:
-            worker.process_batch()
+            sent = worker.process_batch()
+            if sent:
+                logger.info(f"Sent {sent} alert emails")
         except Exception as e:
-            logger.error(f"Alert worker error: {e}")
+            logger.exception(f"Alert Worker error: {e}")
 
-        for _ in range(settings.WORKER_POLL_INTERVAL_SECONDS):
-            if shutdown_event.is_set():
-                break
-            time.sleep(1)
+        shutdown_event.wait(settings.WORKER_POLL_INTERVAL_SECONDS)
 
-    logger.info("Alert worker stopped")
+    logger.info("Alert Worker stopped")
 
 
+# -------------------------------------------------------------------
+# SIGNAL HANDLERS
+# -------------------------------------------------------------------
+def signal_handler(signum, _frame):
+    logger.info(f"Shutdown signal received: {signum}")
+    shutdown_event.set()
+
+
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Run background workers")
-    parser.add_argument(
-        "--worker",
-        "-w",
-        choices=["transcription", "analysis", "alert", "all"],
-        default="all",
-        help="Which worker(s) to run",
-    )
+    logger.info("=" * 65)
+    logger.info("CALL ANALYSIS SYSTEM — WORKERS INITIALIZING")
+    logger.info("=" * 65)
 
-    args = parser.parse_args()
+    # Validate configuration
+    for issue in settings.validate():
+        logger.warning(f"[CONFIG] {issue}")
 
-    # Set up signal handlers
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
+    # Linux/macOS signal handling
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    logger.info("=" * 50)
-    logger.info("  Call Analysis Workers Starting")
-    logger.info("=" * 50)
+    threads = [
+        threading.Thread(
+            target=run_analysis_worker, name="AnalysisWorker", daemon=True
+        ),
+        threading.Thread(target=run_alert_worker, name="AlertWorker", daemon=True),
+    ]
 
-    workers = {
-        "transcription": run_transcription_worker,
-        "analysis": run_analysis_worker,
-        "alert": run_alert_worker,
-    }
+    for t in threads:
+        t.start()
+        logger.info(f"Started {t.name}")
 
-    if args.worker == "all":
-        # Run all workers in threads
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = []
-            for name, worker_fn in workers.items():
-                logger.info(f"Starting {name} worker...")
-                futures.append(executor.submit(worker_fn))
+    # Main wait loop
+    try:
+        while not shutdown_event.is_set():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        shutdown_event.set()
 
-            # Wait for shutdown
-            try:
-                while not shutdown_event.is_set():
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                shutdown_event.set()
+    logger.info("Stopping workers...")
 
-            logger.info("Waiting for workers to stop...")
-    else:
-        # Run single worker
-        worker_fn = workers[args.worker]
-        try:
-            worker_fn()
-        except KeyboardInterrupt:
-            pass
+    for t in threads:
+        t.join(timeout=5)
 
-    logger.info("All workers stopped")
+    logger.info("All workers stopped cleanly")
 
 
 if __name__ == "__main__":
