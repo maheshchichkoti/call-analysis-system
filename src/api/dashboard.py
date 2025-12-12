@@ -7,13 +7,46 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header, Depends
 from pydantic import BaseModel
 
+from ..config import settings
 from ..db.supabase_client import CallRecordsDB, DatabaseError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["Dashboard"])
+
+
+# ------------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------------
+def verify_api_key(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    api_key: Optional[str] = Query(None, alias="key"),
+):
+    """
+    Verify API key from header or query parameter.
+    If DASHBOARD_API_KEY is not set, authentication is disabled.
+    """
+    required_key = settings.DASHBOARD_API_KEY
+
+    # If no key is configured, allow access (development mode)
+    if not required_key:
+        return True
+
+    # Check header first, then query param
+    provided_key = x_api_key or api_key
+
+    if not provided_key:
+        raise HTTPException(
+            status_code=401,
+            detail="API key required. Provide X-API-Key header or ?key= parameter",
+        )
+
+    if provided_key != required_key:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    return True
 
 
 # ------------------------------------------------------------------
@@ -70,6 +103,7 @@ async def list_calls(
     offset: int = Query(0, ge=0),
     status: Optional[str] = Query(None, description="Filter by analysis_status"),
     warning_only: bool = Query(False, description="Only calls with warnings"),
+    _auth: bool = Depends(verify_api_key),
 ):
     """
     Paginated + filtered list of calls.
@@ -94,7 +128,7 @@ async def list_calls(
 # CALL DETAIL ENDPOINT
 # ------------------------------------------------------------------
 @router.get("/calls/{record_id}", response_model=CallDetail)
-async def get_call(record_id: str):
+async def get_call(record_id: str, _auth: bool = Depends(verify_api_key)):
     try:
         call = CallRecordsDB.get_call_by_id(record_id)
         if not call:
@@ -110,7 +144,7 @@ async def get_call(record_id: str):
 # STATS ENDPOINT
 # ------------------------------------------------------------------
 @router.get("/stats", response_model=DashboardStats)
-async def get_stats():
+async def get_stats(_auth: bool = Depends(verify_api_key)):
     try:
         calls = CallRecordsDB.list_calls(limit=2000, offset=0)
 
@@ -184,7 +218,7 @@ async def get_stats():
 # RE-ANALYZE A CALL
 # ------------------------------------------------------------------
 @router.post("/calls/{record_id}/reanalyze")
-async def reanalyze_call(record_id: str):
+async def reanalyze_call(record_id: str, _auth: bool = Depends(verify_api_key)):
     try:
         CallRecordsDB.update_analysis_status(record_id, "pending")
         CallRecordsDB.update_alert_status(record_id, status="pending")

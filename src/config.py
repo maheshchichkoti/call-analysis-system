@@ -51,12 +51,18 @@ class Settings:
     CALL_ALERT_TARGET_EMAIL: Optional[str] = os.getenv("CALL_ALERT_TARGET_EMAIL")
 
     # ---------------------------------------------------------
-    # ZOOM WEBHOOKS
+    # ZOOM WEBHOOKS & OAUTH
     # ---------------------------------------------------------
     ZOOM_CLIENT_ID: Optional[str] = os.getenv("ZOOM_CLIENT_ID")
     ZOOM_CLIENT_SECRET: Optional[str] = os.getenv("ZOOM_CLIENT_SECRET")
-    ZOOM_ACCOUNT_ID: Optional[str] = os.getenv("ZOOM_ACCOUNT_ID")
+    ZOOM_ACCOUNT_ID: Optional[str] = os.getenv(
+        "ZOOM_ACCOUNT_ID"
+    )  # For Server-to-Server
     ZOOM_WEBHOOK_SECRET_TOKEN: Optional[str] = os.getenv("ZOOM_WEBHOOK_SECRET_TOKEN")
+
+    # General OAuth tokens (if using General App instead of Server-to-Server)
+    ZOOM_ACCESS_TOKEN: Optional[str] = os.getenv("ZOOM_ACCESS_TOKEN")
+    ZOOM_REFRESH_TOKEN: Optional[str] = os.getenv("ZOOM_REFRESH_TOKEN")
 
     # Force signature verification in production
     REQUIRE_ZOOM_SIGNATURE: bool = (
@@ -77,6 +83,9 @@ class Settings:
     # ---------------------------------------------------------
     SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
     SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8000"))
+
+    # Dashboard authentication (leave empty to disable)
+    DASHBOARD_API_KEY: Optional[str] = os.getenv("DASHBOARD_API_KEY")
 
     # ---------------------------------------------------------
     # VALIDATION

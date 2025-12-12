@@ -6,7 +6,7 @@ import json
 import requests
 
 # UPDATE THIS URL to your current ngrok/server URL
-WEBHOOK_URL = "https://7cf1a050b896.ngrok-free.app/webhook/zoom"
+WEBHOOK_URL = "https://1912daf18d3f.ngrok-free.app/webhook/zoom"
 SECRET = "y89hMD-cQuy5r-yOoJz6IQ"  # must match settings.ZOOM_WEBHOOK_SECRET_TOKEN on the server
 
 # Generate unique call_id to avoid database duplicate checks

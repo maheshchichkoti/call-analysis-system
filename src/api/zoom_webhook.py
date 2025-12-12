@@ -10,7 +10,7 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Request, HTTPException, Header
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from ..config import settings
 from ..db.supabase_client import CallRecordsDB, DatabaseError
@@ -33,24 +33,51 @@ def verify_signature(body: bytes, signature: str, timestamp: str) -> bool:
         logger.warning("Missing webhook secret — skipping verification")
         return True
 
-    # Replay attack protection
+    # Log for debugging
+    logger.info("Verifying signature...")
+    logger.info(f"  Timestamp from header: {timestamp}")
+    logger.info(f"  Signature from header: {signature[:30]}...")
+    logger.info(f"  Secret configured: {secret[:8]}...")
+
+    # Replay attack protection (be lenient - allow up to 5 minutes)
     try:
         ts = int(timestamp)
-        if abs(time.time() - ts) > 300:
-            logger.warning("Webhook timestamp too old — possible replay attack")
+        # Zoom timestamp could be in seconds or milliseconds
+        if ts > 10000000000:  # If > 10 billion, it's milliseconds
+            ts = ts // 1000
+
+        time_diff = abs(time.time() - ts)
+        logger.info(f"  Time difference: {time_diff:.1f} seconds")
+
+        if time_diff > 600:  # 10 minutes tolerance
+            logger.warning(f"Webhook timestamp too old ({time_diff:.0f}s)")
             return False
     except ValueError:
         logger.warning("Invalid timestamp header")
         return False
 
-    message = f"v0:{timestamp}:{body.decode('utf-8')}"
+    # Calculate expected signature
+    body_str = body.decode("utf-8")
+    message = f"v0:{timestamp}:{body_str}"
     expected_hash = hmac.new(
         secret.encode(), message.encode(), hashlib.sha256
     ).hexdigest()
-
     expected = f"v0={expected_hash}"
 
-    return hmac.compare_digest(expected, signature)
+    logger.info(f"  Expected signature: {expected[:30]}...")
+
+    # Compare
+    is_valid = hmac.compare_digest(expected, signature)
+    if not is_valid:
+        logger.warning("Signature mismatch!")
+        # In development, log but don't reject
+        if settings.ENVIRONMENT == "development":
+            logger.warning(
+                "Development mode - allowing request despite signature mismatch"
+            )
+            return True
+
+    return is_valid
 
 
 # ---------------------------------------------------------
@@ -70,47 +97,60 @@ async def zoom_webhook(
     x_zm_signature: Optional[str] = Header(None),
     x_zm_request_timestamp: Optional[str] = Header(None),
 ):
+    # Get raw body for logging
     body = await request.body()
 
-    # Parse JSON safely
+    # Log EVERYTHING for debugging
+    logger.info("=== ZOOM WEBHOOK RECEIVED ===")
+    logger.info(f"Raw body: {body[:500]}")
+    logger.info(f"Signature header: {x_zm_signature}")
+    logger.info(f"Timestamp header: {x_zm_request_timestamp}")
+
+    # Parse JSON - handle any format
     try:
-        parsed = RecordingCompletedPayload(**(await request.json()))
-    except ValidationError as e:
-        logger.error(f"Invalid webhook payload: {e}")
-        raise HTTPException(400, "Invalid webhook payload")
+        data = await request.json()
+        logger.info(f"Parsed JSON: {data}")
+    except Exception as e:
+        logger.error(f"JSON parse error: {e}")
+        return {"status": "error", "message": "Invalid JSON"}
 
-    event_type = parsed.event
-    payload = parsed.payload
+    event_type = data.get("event", "")
+    payload = data.get("payload", {})
 
-    # URL validation — Zoom handshake
+    logger.info(f"Event type: {event_type}")
+
+    # URL validation — Zoom handshake (NO signature required)
     if event_type == "endpoint.url_validation":
+        logger.info("Processing URL validation...")
         return handle_url_validation(payload)
 
-    # Verify signature for real events
+    # For all other events, verify signature if configured
     if settings.REQUIRE_ZOOM_SIGNATURE:
         if not (x_zm_signature and x_zm_request_timestamp):
+            logger.warning("Missing signature headers")
             raise HTTPException(401, "Missing Zoom signature headers")
 
         if not verify_signature(body, x_zm_signature, x_zm_request_timestamp):
+            logger.warning("Invalid signature")
             raise HTTPException(401, "Invalid Zoom signature")
 
-    logger.info(f"Received Zoom event: {event_type}")
+    logger.info(f"Processing event: {event_type}")
 
-    # Duplicate protection (check BEFORE adding!)
+    # Duplicate protection
     event_id = f"{x_zm_request_timestamp}:{hash(body)}"
     clean_old_events()
 
     if event_id in RECENT_EVENTS:
-        logger.info("Duplicate event received — ignoring")
+        logger.info("Duplicate event — ignoring")
         return {"status": "duplicate"}
 
-    # Add to cache AFTER checking
     RECENT_EVENTS[event_id] = time.time()
 
     # Process the event
     if event_type == "phone.recording_completed":
         return await handle_recording_completed(payload)
 
+    logger.info(f"Unknown event type: {event_type}")
     return {"status": "ignored", "event": event_type}
 
 
@@ -140,42 +180,63 @@ async def handle_recording_completed(payload: dict):
     try:
         obj = payload.get("object", {})
 
-        call_id = obj.get("call_id") or obj.get("id")
-        if not call_id:
-            call_id = f"zoom_{time.time_ns()}"
-            logger.warning(f"Missing call_id — generated new ID: {call_id}")
+        # Zoom sends recordings as an array
+        recordings = obj.get("recordings", [])
 
-        recording_url = obj.get("download_url") or obj.get("recording_file", {}).get(
-            "download_url"
-        )
+        if not recordings:
+            logger.warning("No recordings in payload")
+            return {"status": "error", "message": "No recordings found"}
 
-        caller = obj.get("caller") or {}
-        callee = obj.get("callee") or {}
+        # Process each recording
+        results = []
+        for rec in recordings:
+            call_id = rec.get("call_id") or rec.get("id") or rec.get("call_log_id")
+            if not call_id:
+                call_id = f"zoom_{time.time_ns()}"
+                logger.warning(f"Missing call_id — generated: {call_id}")
 
-        agent_name = callee.get("name") or callee.get("extension_number") or "Unknown"
-        customer_number = caller.get("phone_number") or caller.get("name") or "Unknown"
+            # Extract download URL
+            recording_url = rec.get("download_url")
 
-        start_time = obj.get("date_time") or obj.get("start_time")
-        duration = obj.get("duration")
+            # Agent info from owner or callee
+            owner = rec.get("owner", {})
+            agent_name = owner.get("name") or rec.get("callee_name") or "Unknown"
 
-        # Prevent duplicate processing
-        if CallRecordsDB.get_call_by_call_id(call_id):
-            logger.info(f"Call {call_id} already exists — skipping")
-            return {"status": "duplicate", "call_id": call_id}
+            # Customer info from caller
+            customer_number = (
+                rec.get("caller_number") or rec.get("caller_name") or "Unknown"
+            )
 
-        record_id = CallRecordsDB.insert_call_record(
-            {
-                "call_id": call_id,
-                "agent_name": agent_name,
-                "customer_number": customer_number,
-                "recording_url": recording_url,
-                "start_time": start_time,
-                "duration_seconds": duration,
-            }
-        )
+            start_time = rec.get("date_time")
+            duration = rec.get("duration")
 
-        logger.info(f"Call record created: {record_id}")
-        return {"status": "success", "record_id": record_id}
+            logger.info(
+                f"Processing recording: call_id={call_id}, agent={agent_name}, duration={duration}s"
+            )
+
+            # Prevent duplicate processing
+            if CallRecordsDB.get_call_by_call_id(call_id):
+                logger.info(f"Call {call_id} already exists — skipping")
+                results.append({"call_id": call_id, "status": "duplicate"})
+                continue
+
+            record_id = CallRecordsDB.insert_call_record(
+                {
+                    "call_id": call_id,
+                    "agent_name": agent_name,
+                    "customer_number": customer_number,
+                    "recording_url": recording_url,
+                    "start_time": start_time,
+                    "duration_seconds": duration,
+                }
+            )
+
+            logger.info(f"Call record created: {record_id}")
+            results.append(
+                {"call_id": call_id, "record_id": record_id, "status": "success"}
+            )
+
+        return {"status": "success", "recordings": results}
 
     except DatabaseError as e:
         if "duplicate" in str(e).lower():

@@ -102,21 +102,38 @@ class AnalysisWorker:
     def _download_audio(self, record_id: str, url: str) -> str:
         logger.info(f"Downloading audio for {record_id} → {url}")
 
+        # Check if this is a Zoom URL that needs OAuth
+        is_zoom_url = "zoom.us" in url
+
         last_err = None
 
         for attempt in range(self.MAX_DOWNLOAD_RETRIES):
             try:
-                with httpx.Client(timeout=60) as client:
-                    resp = client.get(url)
-                    resp.raise_for_status()
+                if is_zoom_url:
+                    # Use Zoom OAuth for authenticated download
+                    from ..services.zoom_auth import ZoomAuth, ZoomAuthError
 
-                if len(resp.content) < 2000:
+                    try:
+                        content = ZoomAuth.download_recording(url)
+                        content_type = "audio/mpeg"  # Zoom recordings are typically mp3
+                    except ZoomAuthError as e:
+                        raise CallAnalysisError(f"Zoom auth failed: {e}")
+                else:
+                    # Regular HTTP download for non-Zoom URLs
+                    with httpx.Client(timeout=60) as client:
+                        resp = client.get(url)
+                        resp.raise_for_status()
+                        content = resp.content
+                        content_type = resp.headers.get("content-type", "")
+
+                if len(content) < 2000:
                     raise CallAnalysisError("Downloaded audio file is too small")
 
-                ext = self._infer_extension(url, resp.headers.get("content-type", ""))
+                ext = self._infer_extension(url, content_type)
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    tmp.write(resp.content)
+                    tmp.write(content)
+                    logger.info(f"Downloaded {len(content)} bytes to {tmp.name}")
                     return tmp.name
 
             except Exception as e:
