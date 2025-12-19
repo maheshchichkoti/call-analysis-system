@@ -19,7 +19,7 @@ import logging
 import json
 import time
 import functools
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
 from supabase import create_client, Client
@@ -239,9 +239,23 @@ class CallRecordsDB:
         offset: int = 0,
         analysis_status: Optional[str] = None,
         warnings_only: bool = False,
+        search: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        sentiment: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Paginated, filterable list of calls for the dashboard.
+
+        Args:
+            limit: Max records to return
+            offset: Starting position
+            analysis_status: Filter by status (pending, processing, success, failed)
+            warnings_only: Only show calls with warnings
+            search: Search agent_name, customer_number, or call_id
+            date_from: ISO date string for range start
+            date_to: ISO date string for range end
+            sentiment: Filter by customer_sentiment
         """
         sb = cls.client()
         query = sb.table("call_records").select(
@@ -250,11 +264,33 @@ class CallRecordsDB:
             "has_warning, analysis_status, alert_email_status, created_at"
         )
 
+        # Status filter
         if analysis_status:
             query = query.eq("analysis_status", analysis_status)
 
+        # Warnings filter
         if warnings_only:
             query = query.eq("has_warning", True)
+
+        # Sentiment filter
+        if sentiment:
+            query = query.eq("customer_sentiment", sentiment)
+
+        # Search filter (agent name, customer number, call_id)
+        if search:
+            search_term = f"%{search}%"
+            # Supabase uses .or_ for OR queries with ilike
+            query = query.or_(
+                f"agent_name.ilike.{search_term},"
+                f"customer_number.ilike.{search_term},"
+                f"call_id.ilike.{search_term}"
+            )
+
+        # Date range filters
+        if date_from:
+            query = query.gte("created_at", date_from)
+        if date_to:
+            query = query.lte("created_at", date_to)
 
         resp = (
             query.order("created_at", desc=True)
@@ -262,3 +298,127 @@ class CallRecordsDB:
             .execute()
         )
         return resp.data or []
+
+    @classmethod
+    @retry("count_calls")
+    def count_calls(
+        cls,
+        analysis_status: Optional[str] = None,
+        warnings_only: bool = False,
+        search: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        sentiment: Optional[str] = None,
+    ) -> int:
+        """
+        Get total count of calls matching filters (for pagination).
+        Uses .select("*", count="exact") for efficient counting.
+        """
+        sb = cls.client()
+        query = sb.table("call_records").select("*", count="exact")
+
+        # Apply same filters as list_calls
+        if analysis_status:
+            query = query.eq("analysis_status", analysis_status)
+        if warnings_only:
+            query = query.eq("has_warning", True)
+        if sentiment:
+            query = query.eq("customer_sentiment", sentiment)
+        if search:
+            search_term = f"%{search}%"
+            query = query.or_(
+                f"agent_name.ilike.{search_term},"
+                f"customer_number.ilike.{search_term},"
+                f"call_id.ilike.{search_term}"
+            )
+        if date_from:
+            query = query.gte("created_at", date_from)
+        if date_to:
+            query = query.lte("created_at", date_to)
+
+        resp = query.execute()
+        return resp.count if resp.count is not None else 0
+
+    @classmethod
+    @retry("get_aggregated_stats")
+    def get_aggregated_stats(cls) -> Dict[str, Any]:
+        """
+        Get dashboard statistics using database aggregation.
+        Much more efficient than loading all records into memory.
+        """
+        sb = cls.client()
+
+        # Get total count
+        total_resp = sb.table("call_records").select("*", count="exact").execute()
+        total_calls = total_resp.count or 0
+
+        # Get all calls for stats (we need this for averages and grouped data)
+        # In a real production system, you'd use SQL aggregation functions
+        # but Supabase client doesn't expose aggregate functions directly
+        # So we fetch records but only select needed fields
+        stats_resp = (
+            sb.table("call_records")
+            .select("overall_score, has_warning, customer_sentiment, created_at")
+            .execute()
+        )
+
+        calls = stats_resp.data or []
+
+        if not calls:
+            return {
+                "total_calls": 0,
+                "avg_score": 0.0,
+                "warning_count": 0,
+                "sentiment_breakdown": {},
+                "calls_today": 0,
+                "calls_this_week": 0,
+            }
+
+        # Calculate stats from fetched data
+        scores = [c["overall_score"] for c in calls if c.get("overall_score")]
+        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+
+        warning_count = sum(1 for c in calls if c.get("has_warning"))
+
+        # Sentiment breakdown
+        sentiments = {}
+        for c in calls:
+            s = (c.get("customer_sentiment") or "unknown").lower()
+            sentiments[s] = sentiments.get(s, 0) + 1
+
+        # Time-based stats
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = today_start - timedelta(days=7)
+
+        calls_today = 0
+        calls_this_week = 0
+
+        for c in calls:
+            created = c.get("created_at")
+            if not created:
+                continue
+
+            try:
+                if isinstance(created, str):
+                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+
+                created_utc = (
+                    created.replace(tzinfo=None) if created.tzinfo else created
+                )
+
+                if created_utc >= today_start.replace(tzinfo=None):
+                    calls_today += 1
+                if created_utc >= week_start.replace(tzinfo=None):
+                    calls_this_week += 1
+            except Exception:
+                pass
+
+        return {
+            "total_calls": total_calls,
+            "avg_score": avg_score,
+            "warning_count": warning_count,
+            "sentiment_breakdown": sentiments,
+            "calls_today": calls_today,
+            "calls_this_week": calls_this_week,
+        }

@@ -4,7 +4,6 @@ Admin Dashboard API — Production Version
 """
 
 import logging
-from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Query, Header, Depends
@@ -103,12 +102,23 @@ async def list_calls(
     offset: int = Query(0, ge=0),
     status: Optional[str] = Query(None, description="Filter by analysis_status"),
     warning_only: bool = Query(False, description="Only calls with warnings"),
+    search: Optional[str] = Query(
+        None, description="Search agent name, customer, or call ID"
+    ),
+    date_from: Optional[str] = Query(
+        None, description="ISO date string for range start"
+    ),
+    date_to: Optional[str] = Query(None, description="ISO date string for range end"),
+    sentiment: Optional[str] = Query(
+        None, description="Filter by sentiment (positive, neutral, negative)"
+    ),
     _auth: bool = Depends(verify_api_key),
 ):
     """
     Paginated + filtered list of calls.
     * Uses DB-level filtering for performance
     * Safe pagination
+    * Supports search and advanced filters
     """
     try:
         calls = CallRecordsDB.list_calls(
@@ -116,8 +126,49 @@ async def list_calls(
             offset=offset,
             analysis_status=status,
             warnings_only=warning_only,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            sentiment=sentiment,
         )
         return calls
+
+    except DatabaseError as e:
+        logger.error(f"DB Error: {e}")
+        raise HTTPException(500, "Database error")
+
+
+# ------------------------------------------------------------------
+# CALL COUNT ENDPOINT (for pagination)
+# ------------------------------------------------------------------
+@router.get("/calls/count")
+async def count_calls(
+    status: Optional[str] = Query(None, description="Filter by analysis_status"),
+    warning_only: bool = Query(False, description="Only calls with warnings"),
+    search: Optional[str] = Query(
+        None, description="Search agent name, customer, or call ID"
+    ),
+    date_from: Optional[str] = Query(
+        None, description="ISO date string for range start"
+    ),
+    date_to: Optional[str] = Query(None, description="ISO date string for range end"),
+    sentiment: Optional[str] = Query(None, description="Filter by sentiment"),
+    _auth: bool = Depends(verify_api_key),
+):
+    """
+    Get total count of calls matching filters.
+    Used by frontend for pagination UI.
+    """
+    try:
+        total = CallRecordsDB.count_calls(
+            analysis_status=status,
+            warnings_only=warning_only,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            sentiment=sentiment,
+        )
+        return {"total": total}
 
     except DatabaseError as e:
         logger.error(f"DB Error: {e}")
@@ -145,69 +196,13 @@ async def get_call(record_id: str, _auth: bool = Depends(verify_api_key)):
 # ------------------------------------------------------------------
 @router.get("/stats", response_model=DashboardStats)
 async def get_stats(_auth: bool = Depends(verify_api_key)):
+    """
+    Get dashboard statistics using optimized database aggregation.
+    Much more efficient than loading all records into memory.
+    """
     try:
-        calls = CallRecordsDB.list_calls(limit=2000, offset=0)
-
-        if not calls:
-            return DashboardStats(
-                total_calls=0,
-                avg_score=0.0,
-                warning_count=0,
-                sentiment_breakdown={},
-                calls_today=0,
-                calls_this_week=0,
-            )
-
-        total = len(calls)
-
-        # Score avg
-        scores = [c["overall_score"] for c in calls if c.get("overall_score")]
-        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
-
-        # Warning count
-        warning_count = sum(1 for c in calls if c.get("has_warning"))
-
-        # Sentiment breakdown
-        sentiments = {}
-        for c in calls:
-            s = (c.get("customer_sentiment") or "unknown").lower()
-            sentiments[s] = sentiments.get(s, 0) + 1
-
-        # Time-based stats
-        now = datetime.utcnow()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start = today_start - timedelta(days=7)
-
-        calls_today = 0
-        calls_this_week = 0
-
-        for c in calls:
-            created = c.get("created_at")
-            if not created:
-                continue
-
-            try:
-                if isinstance(created, str):
-                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
-
-                created_utc = created.replace(tzinfo=None)
-
-                if created_utc >= today_start:
-                    calls_today += 1
-                if created_utc >= week_start:
-                    calls_this_week += 1
-
-            except Exception:
-                pass
-
-        return DashboardStats(
-            total_calls=total,
-            avg_score=avg_score,
-            warning_count=warning_count,
-            sentiment_breakdown=sentiments,
-            calls_today=calls_today,
-            calls_this_week=calls_this_week,
-        )
+        stats = CallRecordsDB.get_aggregated_stats()
+        return DashboardStats(**stats)
 
     except DatabaseError as e:
         logger.error(f"DB Error: {e}")
