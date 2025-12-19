@@ -158,7 +158,33 @@ class AnalysisWorker:
 
     # ----------------------------------------------------
     def _save_analysis(self, record_id: str, analysis: dict):
-        CallRecordsDB.update_analysis(record_id, analysis=analysis, status="success")
+        # Check if this is a non-agent call (voicemail, automated system, etc.)
+        if not analysis.get("is_agent_call", True):
+            # For non-agent calls, save summary but mark as 'not_agent_call' status
+            # This prevents them from being included in agent performance metrics
+            logger.info(
+                f"Record {record_id}: Detected non-agent call (voicemail/automated/disconnect)"
+            )
+
+            CallRecordsDB.update_analysis(
+                record_id,
+                analysis={
+                    "overall_score": None,  # No score for non-agent calls
+                    "has_warning": False,
+                    "warning_reasons": [],
+                    "short_summary": analysis.get(
+                        "short_summary", "Non-agent call detected"
+                    ),
+                    "customer_sentiment": "neutral",
+                    "department": analysis.get("department", "general"),
+                },
+                status="not_agent_call",  # Special status
+            )
+        else:
+            # Normal agent call - save full analysis
+            CallRecordsDB.update_analysis(
+                record_id, analysis=analysis, status="success"
+            )
 
     # ----------------------------------------------------
     def run_forever(self):

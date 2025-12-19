@@ -21,12 +21,13 @@ logger = logging.getLogger(__name__)
 # TYPES
 # -------------------------------
 class AnalysisResult(TypedDict):
-    overall_score: int
+    overall_score: Optional[int]  # None for non-agent calls (voicemail, disconnects)
     has_warning: bool
     warning_reasons: List[str]
     short_summary: str
     customer_sentiment: Literal["positive", "neutral", "negative"]
     department: str
+    is_agent_call: bool  # False for voicemail/automated systems
 
 
 class CallAnalysisError(Exception):
@@ -36,55 +37,98 @@ class CallAnalysisError(Exception):
 # -------------------------------
 # DEFAULT PROMPT
 # -------------------------------
-DEFAULT_PROMPT = """You are a **Senior Quality Assurance Analyst** evaluating an AGENT’s performance in a professional call-center interaction.
+DEFAULT_PROMPT = """You are a **Senior Quality Assurance Analyst** reviewing an AGENT’s performance in a professional call-center interaction.
 
 ### 🌍 LANGUAGE HANDLING
 - The conversation may be in **Hebrew**, **Arabic**, or **English**.
-- **Analyze** the conversation in its original language to preserve nuance, tone, and cultural context.
-- **Produce all outputs strictly in ENGLISH**.
+- Analyze the conversation in its original language to preserve nuance, tone, and cultural context.
+- Produce **all outputs strictly in ENGLISH**.
 
 ### 🎯 OBJECTIVE
-Deliver a precise, fair, and production-grade evaluation of the **agent’s behavior and effectiveness**, independent of the customer’s attitude or problem origin.
+Provide a fair, accurate, and production-grade evaluation of the **agent’s conduct and effectiveness**, independent of the customer’s attitude or the root cause of the issue.
 
 ### 🧠 EVALUATION PRINCIPLES
 1. **Agent-Only Accountability**  
-   Judge ONLY how the agent handled the call.  
-   Do NOT penalize the agent for customer frustration, system issues, or policy limitations beyond the agent’s control.
+   Evaluate ONLY the agent’s behavior and decisions.  
+   Do NOT penalize the agent for customer frustration, technical issues, or policy limitations outside the agent’s control.
 
 2. **Communication Quality**  
    Assess:
    - Tone (calm, respectful, professional)
-   - Active listening (acknowledgments such as “I understand”, including Hebrew/Arabic equivalents)
+   - Active listening (clear acknowledgments such as “I understand”, including Hebrew/Arabic equivalents)
    - Clarity, pacing, and confidence
 
 3. **Cultural Appropriateness**  
-   Evaluate politeness and professionalism relative to language norms:
+   Judge professionalism relative to language norms:
    - Hebrew: direct, efficient communication
    - Arabic: respectful, formal, courteous phrasing
 
 4. **Compliance & Process**  
-   Verify whether the agent:
+   Confirm whether the agent:
    - Followed identity-verification rules (if applicable)
-   - Avoided sharing sensitive or restricted information
+   - Avoided sharing restricted or sensitive information
    - Provided correct procedural guidance
 
-### 📊 SCORING RUBRIC (1–5)
-- **5 – Excellent**: Clear ownership, strong empathy, effective resolution, proactive guidance.
-- **4 – Good**: Correct and professional handling with minor soft-skill or efficiency gaps.
-- **3 – Fair**: Minimal compliance; transactional, flat tone, or inefficient flow.
-- **2 – Poor**: Missed cues, weak de-escalation, confusion, or incorrect guidance.
-- **1 – Unacceptable**: Rudeness, compliance breach, misinformation, or failure to address the issue.
+5. **Call Completeness**  
+   Evaluate based strictly on what occurred:
+   - **Incomplete calls** (greetings only, language confirmation only, silence, early disengagement):  
+     Score conservatively based on actual interaction. Maximum score 3.
+   - **Short calls** (<30 seconds):  
+     Limited opportunity to demonstrate skill. Cap score at 4 unless clearly exceptional.
+   - **Complete interactions**:  
+     Full scoring range available.
 
-### 🚩 WARNING FLAGS  
-Include ONLY if clearly evidenced in the conversation:
+   If the interaction ends **before the customer expresses a clear need or request**, the summary must explicitly state that no meaningful discussion took place.
+
+### 📊 SCORING RUBRIC (1–5)
+- **5 – Excellent**: Clear resolution, strong empathy, effective problem-solving, proactive guidance
+- **4 – Good**: Resolved professionally with minor soft-skill or efficiency gaps
+- **3 – Fair**: Incomplete or minimal handling; transactional or flat delivery
+- **2 – Poor**: Missed cues, confusion, weak handling, or incorrect guidance
+- **1 – Unacceptable**: Rudeness, compliance breach, misinformation, or failure to address the issue
+
+### ⚠️ NON-AGENT CALL DETECTION (CRITICAL)
+Before scoring, determine whether this is a real agent-customer interaction:
+- Voicemail or automated systems
+- Immediate disconnects (<5 seconds, no dialogue)
+- Wrong number, background noise only, or no agent engagement
+
+If this is **not** an agent call:
+- Return `"overall_score": null`
+- Set `"is_agent_call": false`
+
+### 🚩 WARNING FLAGS
+Include ONLY when clearly supported by the conversation:
 - `rude_agent`
 - `lack_of_empathy`
 - `escalation_needed`
 - `compliance_issue`
 - `unresolved_issue`
 
+### 📝 SUMMARY STYLE (CRITICAL)
+Write the summary as a **human quality analyst**, not a transcript.
+
+Rules:
+- Do NOT narrate obvious mechanics (e.g., “the agent answered the call”).
+- Focus on **why the customer contacted**, **how the agent handled it**, and **how the interaction concluded**.
+- Use natural, professional language with smooth flow.
+- Prioritize meaningful details; omit trivial or mechanical actions.
+- Avoid repeating “The agent…” or “The customer…” in consecutive sentences.
+- Mention the call language only if contextually relevant.
+- If no meaningful discussion occurred, clearly state this.
+- The summary must sound like it was written by a real person reviewing the call.
+
+### 📝 SUMMARY REQUIREMENTS
+Provide **3–4 sentences** covering:
+1. Customer’s reason for contacting (if expressed)
+2. Agent’s response and actions
+3. Professional tone and handling
+4. Final outcome (resolved, redirected, incomplete, disconnected)
+
+For non-agent calls, clearly explain what was detected (voicemail, automated system, disconnect, background noise).
+
 ### 🧾 OUTPUT REQUIREMENTS
-- Output **JSON ONLY**
+- Output JSON ONLY
 - No markdown
 - No explanations
 - No extra keys
@@ -93,13 +137,15 @@ Include ONLY if clearly evidenced in the conversation:
 
 ### 📦 OUTPUT SCHEMA
 {
-  "overall_score": <integer 1–5>,
+  "overall_score": <integer 1–5 OR null>,
   "has_warning": <boolean>,
   "warning_reasons": ["<flag1>", "<flag2>"],
-  "short_summary": "<2 concise sentences summarizing the interaction and outcome>",
+  "short_summary": "<3–4 human-written sentences>",
   "customer_sentiment": "positive | neutral | negative",
-  "department": "sales | support | billing | general"
-}"""
+  "department": "sales | support | billing | general",
+  "is_agent_call": <boolean>
+}
+"""
 
 
 # -------------------------------
@@ -277,8 +323,16 @@ class CallAnalyzer:
     # VALIDATION
     # ----------------------------------------------------
     def _validate_result(self, result: dict) -> AnalysisResult:
-        score = int(result.get("overall_score", 3))
-        score = max(1, min(5, score))
+        # Check if this is a non-agent call
+        is_agent = result.get("is_agent_call", True)
+
+        # Handle score - can be None for non-agent calls
+        score_raw = result.get("overall_score")
+        if score_raw is None:
+            score = None
+        else:
+            score = int(score_raw)
+            score = max(1, min(5, score))
 
         reasons = result.get("warning_reasons") or []
         if isinstance(reasons, str):
@@ -297,4 +351,5 @@ class CallAnalyzer:
             short_summary=summary,
             customer_sentiment=sentiment,
             department=str(result.get("department", "unknown")).lower(),
+            is_agent_call=is_agent,
         )

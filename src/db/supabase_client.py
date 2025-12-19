@@ -172,20 +172,27 @@ class CallRecordsDB:
     ):
         sb = cls.client()
 
-        if status == "success" and analysis:
+        if status in ("success", "not_agent_call") and analysis:
             payload = {
-                "overall_score": analysis["overall_score"],
-                "has_warning": analysis["has_warning"],
+                "overall_score": analysis.get(
+                    "overall_score"
+                ),  # Can be None for non-agent calls
+                "has_warning": analysis.get("has_warning", False),
                 "warning_reasons_json": json.dumps(analysis.get("warning_reasons", [])),
-                "short_summary": analysis["short_summary"],
-                "customer_sentiment": analysis["customer_sentiment"],
-                "department": analysis["department"],
-                "analysis_status": "success",
+                "short_summary": analysis.get("short_summary", ""),
+                "customer_sentiment": analysis.get("customer_sentiment", "neutral"),
+                "department": analysis.get("department", "unknown"),
+                "analysis_status": status,
                 "analysis_completed_at": _now_iso(),
-                "alert_email_status": (
-                    "pending" if analysis["has_warning"] else "not_needed"
-                ),
             }
+
+            # Only set alert status if this is an actual agent call
+            if status == "success":
+                payload["alert_email_status"] = (
+                    "pending" if analysis.get("has_warning") else "not_needed"
+                )
+            else:
+                payload["alert_email_status"] = "not_needed"
         else:
             payload = {
                 "analysis_status": status,
