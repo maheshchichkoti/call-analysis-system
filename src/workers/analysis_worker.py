@@ -69,7 +69,7 @@ class AnalysisWorker:
 
         logger.info(f"Processing record {record_id}")
 
-        # determine audio source
+        # Determine audio source
         if local_file and Path(local_file).exists():
             audio_path = local_file
         elif recording_url:
@@ -85,13 +85,17 @@ class AnalysisWorker:
                 )
                 self._save_analysis(record_id, analysis)
                 return
+
             raise CallAnalysisError("No audio or transcript available")
 
-        # run Gemini analysis
-        analysis = self.analyzer.analyze_audio(audio_path, agent_name)
+        # Run Gemini analysis
+        duration = record.get("duration_seconds", 0)
+        analysis = self.analyzer.analyze_audio(
+            audio_path, agent_name, duration_seconds=duration
+        )
         self._save_analysis(record_id, analysis)
 
-        # cleanup temp files
+        # Cleanup temp files
         if recording_url and audio_path and audio_path.startswith("/tmp"):
             try:
                 Path(audio_path).unlink()
@@ -102,24 +106,20 @@ class AnalysisWorker:
     def _download_audio(self, record_id: str, url: str) -> str:
         logger.info(f"Downloading audio for {record_id} → {url}")
 
-        # Check if this is a Zoom URL that needs OAuth
         is_zoom_url = "zoom.us" in url
-
         last_err = None
 
         for attempt in range(self.MAX_DOWNLOAD_RETRIES):
             try:
                 if is_zoom_url:
-                    # Use Zoom OAuth for authenticated download
                     from ..services.zoom_auth import ZoomAuth, ZoomAuthError
 
                     try:
                         content = ZoomAuth.download_recording(url)
-                        content_type = "audio/mpeg"  # Zoom recordings are typically mp3
+                        content_type = "audio/mpeg"
                     except ZoomAuthError as e:
                         raise CallAnalysisError(f"Zoom auth failed: {e}")
                 else:
-                    # Regular HTTP download for non-Zoom URLs
                     with httpx.Client(timeout=60) as client:
                         resp = client.get(url)
                         resp.raise_for_status()
@@ -158,33 +158,43 @@ class AnalysisWorker:
 
     # ----------------------------------------------------
     def _save_analysis(self, record_id: str, analysis: dict):
-        # Check if this is a non-agent call (voicemail, automated system, etc.)
-        if not analysis.get("is_agent_call", True):
-            # For non-agent calls, save summary but mark as 'not_agent_call' status
-            # This prevents them from being included in agent performance metrics
+        """
+        Persist analysis results with strict production safety rules.
+        """
+
+        is_agent_call = bool(analysis.get("is_agent_call", True))
+        score = analysis.get("overall_score")
+
+        # 🚫 HARD RULE:
+        # No score = no evaluable agent interaction
+        if not is_agent_call or score is None:
             logger.info(
-                f"Record {record_id}: Detected non-agent call (voicemail/automated/disconnect)"
+                f"Record {record_id}: Non-evaluable call (no meaningful interaction)"
             )
 
             CallRecordsDB.update_analysis(
                 record_id,
                 analysis={
-                    "overall_score": None,  # No score for non-agent calls
+                    "overall_score": None,
                     "has_warning": False,
                     "warning_reasons": [],
                     "short_summary": analysis.get(
-                        "short_summary", "Non-agent call detected"
+                        "short_summary",
+                        "No meaningful interaction occurred; agent performance could not be evaluated.",
                     ),
                     "customer_sentiment": "neutral",
                     "department": analysis.get("department", "general"),
                 },
-                status="not_agent_call",  # Special status
+                status="not_agent_call",
             )
-        else:
-            # Normal agent call - save full analysis
-            CallRecordsDB.update_analysis(
-                record_id, analysis=analysis, status="success"
-            )
+            return
+
+        # ✅ ONLY real, evaluable agent calls reach here
+        CallRecordsDB.update_analysis(
+            record_id,
+            analysis=analysis,
+            status="success",
+        )
 
     # ----------------------------------------------------
     def run_forever(self):

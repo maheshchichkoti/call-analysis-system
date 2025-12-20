@@ -350,80 +350,83 @@ class CallRecordsDB:
     @retry("get_aggregated_stats")
     def get_aggregated_stats(cls) -> Dict[str, Any]:
         """
-        Get dashboard statistics using database aggregation.
-        Much more efficient than loading all records into memory.
+        Fetch aggregated statistics using minimal DB queries.
+        EXCLUDES non-agent calls (voicemail, automated, disconnects) from all metrics.
         """
         sb = cls.client()
 
-        # Get total count
-        total_resp = sb.table("call_records").select("*", count="exact").execute()
-        total_calls = total_resp.count or 0
-
-        # Get all calls for stats (we need this for averages and grouped data)
-        # In a real production system, you'd use SQL aggregation functions
-        # but Supabase client doesn't expose aggregate functions directly
-        # So we fetch records but only select needed fields
-        stats_resp = (
+        # Get total calls (exclude non-agent calls)
+        total_resp = (
             sb.table("call_records")
-            .select("overall_score, has_warning, customer_sentiment, created_at")
+            .select("*", count="exact")
+            .neq("analysis_status", "not_agent_call")  # EXCLUDE voicemail/disconnects
             .execute()
         )
+        total_calls = total_resp.count if total_resp.count is not None else 0
 
-        calls = stats_resp.data or []
+        # Fetch scores to compute average (exclude non-agent calls and null scores)
+        score_resp = (
+            sb.table("call_records")
+            .select("overall_score")
+            .neq("analysis_status", "not_agent_call")  # EXCLUDE voicemail/disconnects
+            .not_.is_("overall_score", "null")
+            .execute()
+        )
+        scores = [r["overall_score"] for r in score_resp.data if r.get("overall_score")]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
 
-        if not calls:
-            return {
-                "total_calls": 0,
-                "avg_score": 0.0,
-                "warning_count": 0,
-                "sentiment_breakdown": {},
-                "calls_today": 0,
-                "calls_this_week": 0,
-            }
+        # Count warnings (exclude non-agent calls)
+        warning_resp = (
+            sb.table("call_records")
+            .select("*", count="exact")
+            .neq("analysis_status", "not_agent_call")  # EXCLUDE voicemail/disconnects
+            .eq("has_warning", True)
+            .execute()
+        )
+        warning_count = warning_resp.count if warning_resp.count is not None else 0
 
-        # Calculate stats from fetched data
-        scores = [c["overall_score"] for c in calls if c.get("overall_score")]
-        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
-
-        warning_count = sum(1 for c in calls if c.get("has_warning"))
-
-        # Sentiment breakdown
+        # Sentiment breakdown (exclude non-agent calls)
+        sentiment_resp = (
+            sb.table("call_records")
+            .select("customer_sentiment")
+            .neq("analysis_status", "not_agent_call")  # EXCLUDE voicemail/disconnects
+            .execute()
+        )
         sentiments = {}
-        for c in calls:
-            s = (c.get("customer_sentiment") or "unknown").lower()
-            sentiments[s] = sentiments.get(s, 0) + 1
+        for r in sentiment_resp.data:
+            sent = r.get("customer_sentiment", "neutral")
+            sentiments[sent] = sentiments.get(sent, 0) + 1
 
-        # Time-based stats
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start = today_start - timedelta(days=7)
+        # Today's calls
+        today = datetime.utcnow().date()
+        start_today = datetime.combine(today, datetime.min.time())
+        calls_today_resp = (
+            sb.table("call_records")
+            .select("*", count="exact")
+            .neq("analysis_status", "not_agent_call")  # EXCLUDE voicemail/disconnects
+            .gte("created_at", start_today.isoformat())
+            .execute()
+        )
+        calls_today = (
+            calls_today_resp.count if calls_today_resp.count is not None else 0
+        )
 
-        calls_today = 0
-        calls_this_week = 0
-
-        for c in calls:
-            created = c.get("created_at")
-            if not created:
-                continue
-
-            try:
-                if isinstance(created, str):
-                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
-
-                created_utc = (
-                    created.replace(tzinfo=None) if created.tzinfo else created
-                )
-
-                if created_utc >= today_start.replace(tzinfo=None):
-                    calls_today += 1
-                if created_utc >= week_start.replace(tzinfo=None):
-                    calls_this_week += 1
-            except Exception:
-                pass
+        # This week's calls
+        start_week = datetime.utcnow() - timedelta(days=7)
+        calls_week_resp = (
+            sb.table("call_records")
+            .select("*", count="exact")
+            .neq("analysis_status", "not_agent_call")  # EXCLUDE voicemail/disconnects
+            .gte("created_at", start_week.isoformat())
+            .execute()
+        )
+        calls_this_week = (
+            calls_week_resp.count if calls_week_resp.count is not None else 0
+        )
 
         return {
             "total_calls": total_calls,
-            "avg_score": avg_score,
+            "avg_score": round(avg_score, 2) if avg_score else 0.0,
             "warning_count": warning_count,
             "sentiment_breakdown": sentiments,
             "calls_today": calls_today,

@@ -166,6 +166,7 @@ class CallAnalyzer:
     def __init__(self, api_key: str = None, model: str = None):
         self.api_key = api_key or settings.GEMINI_API_KEY
         self.model_name = model or settings.GEMINI_MODEL
+        self.last_duration = 0  # Track duration for safety net
 
         if not self.api_key:
             raise CallAnalysisError("GEMINI_API_KEY not configured")
@@ -188,9 +189,15 @@ class CallAnalyzer:
 
     # ----------------------------------------------------
     def analyze_audio(
-        self, audio_path: str, agent_name: Optional[str] = None
+        self,
+        audio_path: str,
+        agent_name: Optional[str] = None,
+        duration_seconds: Optional[int] = None,
     ) -> AnalysisResult:
         """Analyze an audio file with retry logic + stable JSON parsing."""
+
+        # Store duration for validation safety net
+        self.last_duration = duration_seconds or 0
 
         path = Path(audio_path)
         if not path.exists() or path.stat().st_size < 2000:  # <2KB == empty Zoom file
@@ -290,12 +297,13 @@ class CallAnalyzer:
 
         logger.warning("Falling back to default result due to parse error")
         return {
-            "overall_score": 3,
+            "overall_score": None,  # No score for parse errors
             "has_warning": True,
             "warning_reasons": ["parse_error"],
-            "short_summary": "Gemini response could not be parsed.",
+            "short_summary": "Gemini response could not be parsed. Unable to analyze call.",
             "customer_sentiment": "neutral",
             "department": "unknown",
+            "is_agent_call": False,  # Treat as non-agent call to avoid false metrics
         }
 
     # ----------------------------------------------------
@@ -328,7 +336,17 @@ class CallAnalyzer:
 
         # Handle score - can be None for non-agent calls
         score_raw = result.get("overall_score")
-        if score_raw is None:
+
+        # SAFETY NET: Override Gemini if it gave a score to a very short call
+        # This catches cases where Gemini ignores our non-agent call instructions
+        if score_raw is not None and self.last_duration > 0 and self.last_duration < 10:
+            logger.warning(
+                f"🛡️ SAFETY NET: Forcing is_agent_call=false for {self.last_duration}s call "
+                f"(Gemini incorrectly scored it as {score_raw})"
+            )
+            is_agent = False
+            score = None
+        elif score_raw is None:
             score = None
         else:
             score = int(score_raw)
